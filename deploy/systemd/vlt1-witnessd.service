@@ -1,0 +1,70 @@
+# Independently operated VLT/1 freshness witness service.
+#
+# This service MUST run on a host and administrative domain independent from
+# the local vault daemon. It binds loopback only; terminate HTTPS/TLS in an
+# independently administered reverse proxy and route only to 127.0.0.1:9823.
+
+[Unit]
+Description=VLT/1 independently operated freshness witness
+Documentation=https://github.com/Nixort/vlt1
+After=network.target local-fs.target
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/var/lib/vlt1-witness /etc/vlt1-witness
+ConditionPathExists=/etc/vlt1-witness/signing.seed
+ConditionPathExists=/etc/vlt1-witness/auth.token
+
+[Service]
+Type=exec
+User=vlt1-witness
+Group=vlt1-witness
+UMask=0077
+WorkingDirectory=/var/lib/vlt1-witness
+ExecStart=/usr/local/libexec/vlt1/vlt1-witnessd --state /var/lib/vlt1-witness/witness.sqlite --signing-seed /etc/vlt1-witness/signing.seed --auth-token-file /etc/vlt1-witness/auth.token --listen 127.0.0.1:9823
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+LimitNOFILE=1024
+LimitCORE=0
+TasksAccounting=yes
+TasksMax=32
+MemoryAccounting=yes
+MemoryHigh=128M
+MemoryMax=192M
+MemorySwapMax=0
+CPUAccounting=yes
+CPUWeight=25
+
+StateDirectory=vlt1-witness
+StateDirectoryMode=0700
+# /etc/vlt1-witness is provisioned by the operator as root and read-only to
+# this account; never use ConfigurationDirectory= for signing material.
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+KeyringMode=private
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+# Copyright Nixort & Itan Winter <https://github.com/Nixort> 2026.
+#
+# License: GNU General Public License v3.0 or later.
+#
+# VLT/1 — local encrypted vault reference implementation.
+# The workspace layout and validation discipline follow the engineering patterns
+# established in the HRCC and Fjord repositories.
+
+[workspace]
+resolver = "2"
+members = [
+  "crates/vlt1-core",
+  "crates/vlt1-protocol",
+  "crates/vlt1-daemon",
+  "crates/vlt1-cli",
+  "crates/vlt1-witness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+authors = ["Itan Winter (NIxort)"]
+repository = "https://github.com/Nixort/VLT"
+description = "VLT/1 local encrypted vault reference implementation"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+rust_2018_idioms = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
+strip = true

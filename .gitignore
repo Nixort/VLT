@@ -1,0 +1,43 @@
+/target/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.vlt.sqlite
+*.vlt.sqlite-shm
+*.vlt.sqlite-wal
+/results/local_*.csv
+/results/local_*.png
+/results/local_*.md
+.DS_Store
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/.tmp*/
+
+# Local Figma export/cache data; design source files are not ignored.
+/.figma-cache/
+/figma-cache/
+*.figcache
+
+# Python tooling caches and generated coverage output.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# JavaScript package-manager caches and dependencies.
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/cache/
+
+# Editor and operating-system transient files.
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+Thumbs.db

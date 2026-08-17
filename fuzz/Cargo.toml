@@ -1,0 +1,39 @@
+# Copyright Nixort & Itan Winter <https://github.com/Nixort> 2026.
+#
+# License: GNU General Public License v3.0 or later.
+#
+# Intentionally independent Cargo-fuzz project. Do not add it to the root workspace.
+
+[package]
+name = "vlt1-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Itan Winter (NIxort)"]
+
+# Cargo-fuzz builds with sanitizer-specific profiles and must remain outside the
+# root workspace validation and release graph.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.7"
+vlt1-core = { path = "../crates/vlt1-core" }
+vlt1-protocol = { path = "../crates/vlt1-protocol" }
+
+[[bin]]
+name = "manifest_decode"
+path = "fuzz_targets/manifest_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_decode"
+path = "fuzz_targets/ipc_decode.rs"
+test = false
+doc = false
+bench = false

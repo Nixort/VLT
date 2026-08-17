@@ -1,0 +1,69 @@
+# VLT/1 system service template for a local-only vault daemon.
+# Instantiate as: systemctl enable --now vlt1d@<local-user>.service
+#
+# For a daemon that uses an independently operated HTTPS freshness witness,
+# use vlt1d-witness@.service instead. This local-only profile deliberately
+# allows AF_UNIX only.
+
+[Unit]
+Description=VLT/1 local encrypted vault daemon for %i
+Documentation=https://github.com/Nixort/vlt1
+After=local-fs.target
+RequiresMountsFor=/var/lib/vlt1-%i
+ConditionPathExists=/var/lib/vlt1-%i/vault.sqlite
+
+[Service]
+Type=exec
+User=%i
+UMask=0077
+WorkingDirectory=/var/lib/vlt1-%i
+ExecStart=/usr/local/libexec/vlt1/vlt1d --vault /var/lib/vlt1-%i/vault.sqlite --socket /run/vlt1-%i/vlt1.sock --allow-uid %U
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+LimitNOFILE=4096
+LimitCORE=0
+TasksAccounting=yes
+TasksMax=64
+MemoryAccounting=yes
+MemoryHigh=256M
+MemoryMax=384M
+MemorySwapMax=0
+CPUAccounting=yes
+CPUWeight=50
+
+# Managed private paths. StateDirectory remains writable under ProtectSystem=strict.
+RuntimeDirectory=vlt1-%i
+RuntimeDirectoryMode=0700
+StateDirectory=vlt1-%i
+StateDirectoryMode=0700
+
+# Privilege, process, device, network, and namespace restrictions.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+KeyringMode=private
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

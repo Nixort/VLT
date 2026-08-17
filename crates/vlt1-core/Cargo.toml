@@ -1,0 +1,36 @@
+# VLT/1 core: encrypted records, key envelopes, manifests and SQLite persistence.
+
+[package]
+name = "vlt1-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "VLT/1 cryptographic vault core"
+
+[lints]
+workspace = true
+
+[features]
+fault-injection = []
+
+[dependencies]
+aes-gcm-siv = "=0.11.1"
+argon2 = "=0.5.3"
+base64 = "=0.22.0"
+ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
+hkdf = "=0.12.4"
+rand = "=0.8.5"
+rusqlite = { version = "=0.31.0", features = ["backup", "bundled"] }
+serde = { version = "=1.0.197", features = ["derive"] }
+serde_json = "=1.0.114"
+sha2 = "=0.10.8"
+thiserror = "=1.0.57"
+ureq = { version = "=2.12.1", features = ["json", "tls"] }
+zeroize = "=1.7.0"
+
+[dev-dependencies]
+proptest = "=1.5.0"
+rusqlite = { version = "=0.31.0", features = ["backup", "bundled"] }
+tempfile = "=3.10.1"

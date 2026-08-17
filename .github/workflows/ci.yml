@@ -1,0 +1,34 @@
+# Copyright Nixort & Itan Winter <https://github.com/Nixort> 2026.
+#
+# License: GNU General Public License v3.0 or later.
+
+name: VLT/1 CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Stable quality gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo test -p vlt1-core --features fault-injection
+      - run: cargo build --release --workspace
+
+  msrv:
+    name: MSRV 1.75 locked build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - run: cargo check --workspace --locked

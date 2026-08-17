@@ -1,0 +1,73 @@
+# VLT/1 daemon with strict external freshness witness enforcement.
+# Instantiate only after provisioning both files in /var/lib/vlt1-%i/:
+#   witness.token      mode 0600, the HTTPS witness bearer credential
+#   witness-public.key mode 0600, 64 lowercase hex Ed25519 public-key bytes
+#
+# The witness MUST be independently deployed. This profile enables IPv4/IPv6
+# only because an HTTPS witness transport needs DNS/TCP; use the local-only
+# vlt1d@.service when no external witness is configured.
+
+[Unit]
+Description=VLT/1 witness-enforced encrypted vault daemon for %i
+Documentation=https://github.com/Nixort/vlt1
+After=network-online.target local-fs.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/vlt1-%i
+ConditionPathExists=/var/lib/vlt1-%i/vault.sqlite
+ConditionPathExists=/var/lib/vlt1-%i/witness.token
+ConditionPathExists=/var/lib/vlt1-%i/witness-public.key
+
+[Service]
+Type=exec
+User=%i
+UMask=0077
+WorkingDirectory=/var/lib/vlt1-%i
+ExecStart=/usr/local/libexec/vlt1/vlt1d --vault /var/lib/vlt1-%i/vault.sqlite --socket /run/vlt1-%i/vlt1.sock --allow-uid %U --witness-endpoint $VLT1_WITNESS_ENDPOINT --witness-token-file /var/lib/vlt1-%i/witness.token --witness-public-key-file /var/lib/vlt1-%i/witness-public.key
+EnvironmentFile=/etc/vlt1/witness-%i.conf
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+LimitNOFILE=4096
+LimitCORE=0
+TasksAccounting=yes
+TasksMax=64
+MemoryAccounting=yes
+MemoryHigh=256M
+MemoryMax=384M
+MemorySwapMax=0
+CPUAccounting=yes
+CPUWeight=50
+
+RuntimeDirectory=vlt1-%i
+RuntimeDirectoryMode=0700
+StateDirectory=vlt1-%i
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+KeyringMode=private
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

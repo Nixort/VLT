@@ -1,0 +1,30 @@
+# VLT/1 command-line interface and reproducible benchmark driver.
+
+[package]
+name = "vlt1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "VLT/1 local vault command-line interface"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "=1.0.79"
+base64 = "=0.22.0"
+clap = { version = "=4.5.1", features = ["derive"] }
+rpassword = "=7.3.1"
+vlt1-core = { path = "../vlt1-core" }
+vlt1-daemon = { path = "../vlt1-daemon" }
+vlt1-protocol = { path = "../vlt1-protocol" }
+
+[[bin]]
+name = "vlt1"
+path = "src/main.rs"
+
+[[bin]]
+name = "vlt1-bench"
+path = "src/bin/vlt1-bench.rs"
