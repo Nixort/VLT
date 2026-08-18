@@ -28,6 +28,12 @@ pub const DEFAULT_ARGON2_MEMORY_KIB: u32 = 65_536;
 pub const DEFAULT_ARGON2_ITERATIONS: u32 = 3;
 /// Default Argon2id parallelism, matching the RFC 9106 64-MiB profile.
 pub const DEFAULT_ARGON2_LANES: u32 = 4;
+/// Maximum accepted persisted Argon2id memory cost in KiB (256 MiB).
+pub const MAX_ARGON2_MEMORY_KIB: u32 = 256 * 1024;
+/// Maximum accepted persisted Argon2id time cost.
+pub const MAX_ARGON2_ITERATIONS: u32 = 10;
+/// Maximum accepted persisted Argon2id lane count.
+pub const MAX_ARGON2_LANES: u32 = 8;
 
 /// Parameters stored with an encrypted Root Key envelope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,15 +56,51 @@ impl KdfParams {
             lanes: DEFAULT_ARGON2_LANES,
         }
     }
+
+    /// Validates caller-supplied parameters before creating a new envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error when the parameters exceed VLT/1's bounded KDF
+    /// resource policy or cannot be represented by the Argon2 implementation.
+    pub fn validate_for_creation(self) -> Result<()> {
+        if !self.within_resource_policy() {
+            return Err(VaultError::InvalidInput("Argon2id KDF parameter policy"));
+        }
+        Params::new(self.memory_kib, self.iterations, self.lanes, Some(32))
+            .map_err(|_| VaultError::InvalidInput("invalid Argon2id parameters"))?;
+        Ok(())
+    }
+
+    /// Validates parameters loaded from an existing encrypted vault envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a format error before Argon2 can allocate resources when stored
+    /// metadata exceeds VLT/1's KDF policy or is structurally invalid.
+    pub fn validate_persisted(self) -> Result<()> {
+        if !self.within_resource_policy() {
+            return Err(VaultError::invalid_format("Argon2id KDF parameter policy"));
+        }
+        Params::new(self.memory_kib, self.iterations, self.lanes, Some(32))
+            .map_err(|_| VaultError::invalid_format("invalid Argon2id parameters"))?;
+        Ok(())
+    }
+
+    const fn within_resource_policy(self) -> bool {
+        self.memory_kib <= MAX_ARGON2_MEMORY_KIB
+            && self.iterations <= MAX_ARGON2_ITERATIONS
+            && self.lanes <= MAX_ARGON2_LANES
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         open_root_key, seal_root_key, KdfParams, DEFAULT_ARGON2_ITERATIONS, DEFAULT_ARGON2_LANES,
-        DEFAULT_ARGON2_MEMORY_KIB,
+        DEFAULT_ARGON2_MEMORY_KIB, MAX_ARGON2_ITERATIONS, MAX_ARGON2_MEMORY_KIB,
     };
-    use crate::format::VaultId;
+    use crate::{format::VaultId, VaultError};
 
     #[test]
     fn interactive_profile_matches_the_documented_rfc_9106_64_mib_profile() {
@@ -73,6 +115,32 @@ mod tests {
         assert_eq!(DEFAULT_ARGON2_MEMORY_KIB, 65_536);
         assert_eq!(DEFAULT_ARGON2_ITERATIONS, 3);
         assert_eq!(DEFAULT_ARGON2_LANES, 4);
+    }
+
+    #[test]
+    fn persisted_kdf_parameters_reject_excessive_resource_use() {
+        let parameters = KdfParams {
+            memory_kib: MAX_ARGON2_MEMORY_KIB + 1,
+            iterations: 1,
+            lanes: 1,
+        };
+        assert!(matches!(
+            parameters.validate_persisted(),
+            Err(VaultError::InvalidFormat("Argon2id KDF parameter policy"))
+        ));
+    }
+
+    #[test]
+    fn new_kdf_parameters_reject_excessive_resource_use() {
+        let parameters = KdfParams {
+            memory_kib: DEFAULT_ARGON2_MEMORY_KIB,
+            iterations: MAX_ARGON2_ITERATIONS + 1,
+            lanes: 1,
+        };
+        assert!(matches!(
+            parameters.validate_for_creation(),
+            Err(VaultError::InvalidInput("Argon2id KDF parameter policy"))
+        ));
     }
 
     #[test]
@@ -123,6 +191,7 @@ pub fn seal_root_key(
     root_key: &[u8; 32],
     params: KdfParams,
 ) -> Result<RootEnvelope> {
+    params.validate_for_creation()?;
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
     let mut passphrase_key = derive_passphrase_key(passphrase, &salt, params)?;
@@ -271,8 +340,9 @@ fn derive_passphrase_key(
     salt: &[u8; 16],
     params: KdfParams,
 ) -> Result<Zeroizing<[u8; 32]>> {
+    params.validate_persisted()?;
     let params = Params::new(params.memory_kib, params.iterations, params.lanes, Some(32))
-        .map_err(|_| VaultError::InvalidInput("invalid Argon2id parameters"))?;
+        .map_err(|_| VaultError::invalid_format("invalid Argon2id parameters"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut output = Zeroizing::new([0u8; 32]);
     argon2

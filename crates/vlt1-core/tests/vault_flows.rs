@@ -6,7 +6,7 @@
 
 use rusqlite::Connection;
 use tempfile::tempdir;
-use vlt1_core::{ObjectId, Vault, VaultStatus};
+use vlt1_core::{ObjectId, Vault, VaultError, VaultStatus};
 
 fn create_vault() -> (tempfile::TempDir, std::path::PathBuf, Vault) {
     let directory = tempdir().expect("temporary test directory");
@@ -144,6 +144,23 @@ fn startup_integrity_scan_rejects_a_dangling_active_version_pointer() {
     drop(connection);
 
     assert!(Vault::open(path).is_err());
+}
+
+#[test]
+fn startup_rejects_excessive_persisted_kdf_parameters() {
+    let (_directory, path, vault) = create_vault();
+    drop(vault);
+
+    let connection = Connection::open(&path).expect("open SQLite for KDF tamper fixture");
+    connection
+        .execute("UPDATE vault_meta SET argon_memory_kib = 262145", [])
+        .expect("tamper persisted Argon2id memory cost");
+    drop(connection);
+
+    assert!(matches!(
+        Vault::open(path),
+        Err(VaultError::InvalidFormat("Argon2id KDF parameter policy"))
+    ));
 }
 
 #[cfg(feature = "fault-injection")]

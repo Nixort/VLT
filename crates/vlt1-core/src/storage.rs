@@ -99,14 +99,16 @@ impl Storage {
                 "unsupported vault format version",
             ));
         }
+        let params = KdfParams {
+            memory_kib,
+            iterations,
+            lanes,
+        };
+        params.validate_persisted()?;
         Ok(RootEnvelope {
             vault_id: crate::format::VaultId::from_slice(&vault_id)?,
             salt: bytes16(&salt)?,
-            params: KdfParams {
-                memory_kib,
-                iterations,
-                lanes,
-            },
+            params,
             record: SealedRecord {
                 nonce: bytes12(&nonce)?,
                 ciphertext,
