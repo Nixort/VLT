@@ -5,8 +5,9 @@
 //! VLT/1 local daemon client and direct vault bootstrap command.
 
 use std::{
-    fs,
-    os::unix::net::UnixStream,
+    fs::{self, File},
+    io::Write,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
 };
 
@@ -14,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use rpassword::prompt_password;
+use tempfile::NamedTempFile;
 use vlt1_core::{manifest_path, BackupManifest, Vault};
 use vlt1_protocol::{read_frame, write_frame, Request, Response, Success};
 
@@ -209,12 +211,6 @@ fn put(socket: &Path, object_id: &str, input: &Path) -> Result<()> {
 }
 
 fn get(socket: &Path, object_id: &str, output: &Path) -> Result<()> {
-    if output.exists() {
-        bail!(
-            "refusing to overwrite plaintext output: {}",
-            output.display()
-        );
-    }
     match request(
         socket,
         &Request::Get {
@@ -225,8 +221,7 @@ fn get(socket: &Path, object_id: &str, output: &Path) -> Result<()> {
             let plaintext = STANDARD
                 .decode(plaintext_b64)
                 .context("daemon returned invalid plaintext base64")?;
-            fs::write(output, plaintext)
-                .with_context(|| format!("could not write {}", output.display()))?;
+            write_new_plaintext(output, &plaintext)?;
             println!("verified and wrote {}", output.display());
             Ok(())
         }
@@ -269,6 +264,50 @@ fn restore(backup: &Path, manifest: Option<&Path>, output: &Path) -> Result<()> 
     Vault::restore_from_backup(backup, &manifest, output)
         .with_context(|| format!("could not restore verified backup {}", backup.display()))?;
     println!("restored verified encrypted vault to {}", output.display());
+    Ok(())
+}
+
+fn write_new_plaintext(output: &Path, plaintext: &[u8]) -> Result<()> {
+    let parent = output
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .context("plaintext output parent directory does not exist")?;
+    let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "could not create temporary output beside {}",
+            output.display()
+        )
+    })?;
+    temporary
+        .as_file_mut()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| {
+            format!(
+                "could not protect temporary output for {}",
+                output.display()
+            )
+        })?;
+    temporary
+        .write_all(plaintext)
+        .with_context(|| format!("could not write temporary output for {}", output.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("could not sync temporary output for {}", output.display()))?;
+    fs::hard_link(temporary.path(), output).with_context(|| {
+        format!(
+            "refusing to overwrite plaintext output: {}",
+            output.display()
+        )
+    })?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| {
+            format!(
+                "could not sync plaintext output directory: {}",
+                parent.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -347,5 +386,48 @@ impl ErrorCodeText for vlt1_protocol::Failure {
             vlt1_protocol::ErrorCode::Policy => "policy denied",
             vlt1_protocol::ErrorCode::Internal => "internal error",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use tempfile::tempdir;
+
+    use super::write_new_plaintext;
+
+    #[test]
+    fn plaintext_output_is_private_and_matches_verified_bytes() {
+        let directory = tempdir().expect("temporary directory");
+        let output = directory.path().join("recovered.txt");
+
+        write_new_plaintext(&output, b"verified plaintext").expect("write new plaintext");
+
+        assert_eq!(
+            fs::read(&output).expect("read output"),
+            b"verified plaintext"
+        );
+        assert_eq!(
+            fs::metadata(&output)
+                .expect("output metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn plaintext_output_refuses_to_overwrite_existing_file() {
+        let directory = tempdir().expect("temporary directory");
+        let output = directory.path().join("existing.txt");
+        fs::write(&output, b"existing plaintext").expect("write existing output");
+
+        assert!(write_new_plaintext(&output, b"replacement").is_err());
+        assert_eq!(
+            fs::read(&output).expect("read existing output"),
+            b"existing plaintext"
+        );
     }
 }

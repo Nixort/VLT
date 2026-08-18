@@ -11,13 +11,14 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 use crate::{error::Result, format::VaultId, VaultError};
 
@@ -133,20 +134,18 @@ pub(crate) fn create_snapshot(
     destination: &Path,
 ) -> Result<BackupManifest> {
     ensure_new_destination(destination)?;
-    let temporary = temporary_path(destination);
-    remove_if_exists(&temporary)?;
+    let temporary = create_temporary_file(destination)?;
     connection
-        .backup(DatabaseName::Main, &temporary, None)
+        .backup(DatabaseName::Main, temporary.path(), None)
         .map_err(|_| VaultError::Storage)?;
-    sync_file(&temporary)?;
-    let snapshot_vault_id = verify_snapshot_database(&temporary)?;
+    sync_file(temporary.path())?;
+    let snapshot_vault_id = verify_snapshot_database(temporary.path())?;
     if snapshot_vault_id != vault_id {
         return Err(VaultError::Invariant("backup vault ID binding"));
     }
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o600))
         .map_err(|_| VaultError::Storage)?;
-    fs::rename(&temporary, destination).map_err(|_| VaultError::Storage)?;
-    sync_parent(destination)?;
+    publish_new_file(&temporary, destination)?;
 
     let manifest = BackupManifest::from_snapshot(vault_id, destination)?;
     let manifest_path = manifest_path(destination);
@@ -168,22 +167,20 @@ pub(crate) fn restore_snapshot(
 ) -> Result<()> {
     manifest.verify_backup(backup)?;
     ensure_new_destination(destination)?;
-    let temporary = temporary_path(destination);
-    remove_if_exists(&temporary)?;
+    let temporary = create_temporary_file(destination)?;
     let source = Connection::open_with_flags(
         backup,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| VaultError::Storage)?;
     source
-        .backup(DatabaseName::Main, &temporary, None)
+        .backup(DatabaseName::Main, temporary.path(), None)
         .map_err(|_| VaultError::Storage)?;
-    sync_file(&temporary)?;
-    verify_snapshot_database(&temporary)?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+    sync_file(temporary.path())?;
+    verify_snapshot_database(temporary.path())?;
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o600))
         .map_err(|_| VaultError::Storage)?;
-    fs::rename(&temporary, destination).map_err(|_| VaultError::Storage)?;
-    sync_parent(destination)
+    publish_new_file(&temporary, destination)
 }
 
 /// Returns the manifest path paired with one encrypted `SQLite` snapshot.
@@ -243,12 +240,11 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)
         .map_err(|_| VaultError::Storage)?;
     file.write_all(bytes).map_err(|_| VaultError::Storage)?;
     file.sync_all().map_err(|_| VaultError::Storage)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|_| VaultError::Storage)?;
     sync_parent(path)
 }
 
@@ -262,20 +258,17 @@ fn ensure_new_destination(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn temporary_path(destination: &Path) -> PathBuf {
-    PathBuf::from(format!(
-        "{}.tmp.{}",
-        destination.display(),
-        std::process::id()
-    ))
+fn create_temporary_file(destination: &Path) -> Result<NamedTempFile> {
+    let parent = destination
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or(VaultError::InvalidInput("backup destination path"))?;
+    NamedTempFile::new_in(parent).map_err(|_| VaultError::Storage)
 }
 
-fn remove_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(VaultError::Storage),
-    }
+fn publish_new_file(temporary: &NamedTempFile, destination: &Path) -> Result<()> {
+    fs::hard_link(temporary.path(), destination).map_err(|_| VaultError::Storage)?;
+    sync_parent(destination)
 }
 
 fn sync_file(path: &Path) -> Result<()> {

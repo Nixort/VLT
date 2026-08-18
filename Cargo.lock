@@ -1204,6 +1204,7 @@ dependencies = [
  "base64",
  "clap",
  "rpassword",
+ "tempfile",
  "vlt1-core",
  "vlt1-daemon",
  "vlt1-protocol",
