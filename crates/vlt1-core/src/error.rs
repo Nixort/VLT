@@ -10,6 +10,10 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, VaultError>;
 
 /// Errors returned without plaintext, passphrases or key material.
+///
+/// The `VaultError` name is retained as the stable root-level error type exposed
+/// by the crate, rather than forcing callers to import the private module name.
+#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Error)]
 pub enum VaultError {
     /// The caller must unlock the vault before using it.

@@ -24,6 +24,10 @@ use crate::{error::Result, format::VaultId, VaultError};
 const BACKUP_FORMAT: &str = "VLT/1 encrypted SQLite backup v1";
 
 /// Non-secret integrity metadata stored beside a VLT/1 encrypted backup.
+///
+/// The public type name deliberately retains the `Backup` prefix so callers can
+/// distinguish it from the encrypted object Manifest without importing this module.
+#[allow(clippy::module_name_repetitions)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BackupManifest {
     format: String,

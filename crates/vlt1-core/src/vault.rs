@@ -28,6 +28,9 @@ pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 pub const MAX_CHUNKS_PER_VERSION: u32 = 1 << 24;
 
 /// Observable lifecycle state of a VLT/1 instance.
+///
+/// The `VaultStatus` name remains explicit in the root public API.
+#[allow(clippy::module_name_repetitions)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VaultStatus {
     /// The Root Key is unavailable and secret operations are rejected.
@@ -442,7 +445,7 @@ impl Vault {
         }
 
         let version_id = VersionId::random();
-        let mut dek = generate_dek();
+        let mut data_key = generate_dek();
         let mut chunks = Vec::with_capacity(chunk_count_usize);
         let mut digest_input = Vec::with_capacity(chunk_count_usize);
         for (offset, chunk) in plaintext.chunks(chunk_size).enumerate() {
@@ -457,7 +460,7 @@ impl Vault {
                 index,
                 chunk_len,
             );
-            let record = seal(&dek[..], &aad, chunk)?;
+            let record = seal(&data_key[..], &aad, chunk)?;
             digest_input.push((index, record.clone()));
             chunks.push(EncryptedChunk { index, record });
         }
@@ -471,7 +474,7 @@ impl Vault {
             chunk_digest: chunk_digest(&digest_input),
         };
         let manifest_bytes = encode_manifest(&manifest);
-        let mut manifest_key = derive_manifest_key(&dek, version_id)?;
+        let mut manifest_key = derive_manifest_key(&data_key, version_id)?;
         let manifest = seal(
             &manifest_key[..],
             &manifest_aad(self.envelope.vault_id, object_id, version_id),
@@ -479,14 +482,14 @@ impl Vault {
         )?;
         manifest_key.zeroize();
 
-        let mut kek = derive_kek(root_key, self.envelope.vault_id)?;
+        let mut wrapping_key = derive_kek(root_key, self.envelope.vault_id)?;
         let wrapped_dek = seal(
-            &kek[..],
+            &wrapping_key[..],
             &wrapped_dek_aad(self.envelope.vault_id, object_id, version_id),
-            &dek[..],
+            &data_key[..],
         )?;
-        kek.zeroize();
-        dek.zeroize();
+        wrapping_key.zeroize();
+        data_key.zeroize();
 
         Ok(PreparedVersion {
             stored_version: StoredVersion {
@@ -508,21 +511,21 @@ impl Vault {
         if version.object_id != object_id {
             return Err(VaultError::Invariant("object pointer binding"));
         }
-        let mut kek = derive_kek(root_key, self.envelope.vault_id)?;
-        let mut dek_bytes = open(
-            &kek[..],
+        let mut wrapping_key = derive_kek(root_key, self.envelope.vault_id)?;
+        let mut data_key_bytes = open(
+            &wrapping_key[..],
             &wrapped_dek_aad(self.envelope.vault_id, object_id, version.version_id),
             &version.wrapped_dek,
         )?;
-        kek.zeroize();
-        let dek: [u8; 32] = dek_bytes
+        wrapping_key.zeroize();
+        let data_key: [u8; 32] = data_key_bytes
             .as_slice()
             .try_into()
             .map_err(|_| VaultError::invalid_format("wrapped DEK length"))?;
-        dek_bytes.zeroize();
-        let mut dek = Zeroizing::new(dek);
+        data_key_bytes.zeroize();
+        let mut data_key = Zeroizing::new(data_key);
 
-        let mut manifest_key = derive_manifest_key(&dek, version.version_id)?;
+        let mut manifest_key = derive_manifest_key(&data_key, version.version_id)?;
         let mut manifest_bytes = open(
             &manifest_key[..],
             &manifest_aad(self.envelope.vault_id, object_id, version.version_id),
@@ -564,7 +567,7 @@ impl Vault {
                 chunk.index,
                 expected_chunk_len,
             );
-            let mut part = open(&dek[..], &aad, &chunk.record)?;
+            let mut part = open(&data_key[..], &aad, &chunk.record)?;
             if part.len() != expected_chunk_len as usize {
                 part.zeroize();
                 return Err(VaultError::invalid_format("authenticated chunk length"));
@@ -572,7 +575,7 @@ impl Vault {
             plaintext.extend_from_slice(&part);
             part.zeroize();
         }
-        dek.zeroize();
+        data_key.zeroize();
         if plaintext.len() != expected_len {
             plaintext.zeroize();
             return Err(VaultError::Invariant(

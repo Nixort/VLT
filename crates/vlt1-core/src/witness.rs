@@ -33,6 +33,10 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HTTP_BODY: u64 = 16 * 1024;
 
 /// A request for a witness to acknowledge one immutable VLT/1 version.
+///
+/// The explicit prefix keeps the root public API clear when requests from
+/// multiple service boundaries are used together.
+#[allow(clippy::module_name_repetitions)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WitnessRequest {
     vault_id: VaultId,
@@ -100,6 +104,10 @@ impl WitnessRequest {
 }
 
 /// An Ed25519-signed acknowledgement of an immutable VLT/1 version.
+///
+/// The explicit prefix keeps the root public API clear when receipts from
+/// multiple service boundaries are used together.
+#[allow(clippy::module_name_repetitions)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WitnessReceipt {
     vault_id: VaultId,
@@ -248,6 +256,10 @@ impl WitnessReceipt {
 }
 
 /// A challenge-bound signed view of one witness object head.
+///
+/// The explicit prefix keeps the root public API clear when heads from
+/// multiple service boundaries are used together.
+#[allow(clippy::module_name_repetitions)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WitnessHead {
     vault_id: VaultId,
@@ -419,6 +431,8 @@ impl WitnessHead {
 ///
 /// Implementations must preserve a conditional monotonic epoch per object and
 /// keep their Ed25519 signing key outside the VLT/1 local trust boundary.
+/// The explicit prefix distinguishes this interface from unrelated providers.
+#[allow(clippy::module_name_repetitions)]
 pub trait WitnessProvider {
     /// Conditionally obtains one signed receipt for `request`.
     ///

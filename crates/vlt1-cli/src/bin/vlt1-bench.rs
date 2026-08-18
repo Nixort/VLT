@@ -40,7 +40,7 @@ fn run(config: &Config, directory: &Path) -> Result<()> {
 
 fn benchmark_direct(config: &Config, directory: &Path) -> Result<()> {
     let vault_path = directory.join("direct.vlt.sqlite");
-    let mut vault = Vault::create(&vault_path, "benchmark-only-passphrase")
+    let mut vault = Vault::create(vault_path, "benchmark-only-passphrase")
         .context("could not initialize direct benchmark vault")?;
     for payload_kib in &config.payloads_kib {
         let payload = payload_for(*payload_kib)?;
