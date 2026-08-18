@@ -19,9 +19,9 @@ clap = { version = "=4.5.1", features = ["derive"] }
 rpassword = "=7.3.1"
 tempfile = "=3.10.1"
 zeroize = "=1.7.0"
-vlt1-core = { path = "../vlt1-core" }
-vlt1-daemon = { path = "../vlt1-daemon" }
-vlt1-protocol = { path = "../vlt1-protocol" }
+vlt1-core = { path = "../vlt1-core", version = "0.1.0" }
+vlt1-daemon = { path = "../vlt1-daemon", version = "0.1.0" }
+vlt1-protocol = { path = "../vlt1-protocol", version = "0.1.0" }
 
 [[bin]]
 name = "vlt1"
