@@ -321,18 +321,44 @@ pub fn wrapped_dek_aad(vault_id: VaultId, object_id: ObjectId, version_id: Versi
     aad
 }
 
+/// Incrementally computes the digest committed by a Manifest over encrypted chunks.
+pub(crate) struct ChunkDigestBuilder {
+    hasher: Sha256,
+}
+
+impl ChunkDigestBuilder {
+    /// Starts a digest in the VLT/1 encrypted-chunk domain.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"VLT1/CHUNK-DIGEST\0");
+        Self { hasher }
+    }
+
+    /// Adds one canonical encrypted chunk record.
+    pub(crate) fn update(&mut self, index: u32, record: &SealedRecord) {
+        self.hasher.update(index.to_be_bytes());
+        self.hasher.update(record.nonce);
+        self.hasher
+            .update((record.ciphertext.len() as u64).to_be_bytes());
+        self.hasher.update(&record.ciphertext);
+    }
+
+    /// Returns the final 256-bit digest.
+    #[must_use]
+    pub(crate) fn finalize(self) -> [u8; 32] {
+        self.hasher.finalize().into()
+    }
+}
+
 /// Computes the digest committed by a Manifest over every encrypted chunk.
 #[must_use]
 pub fn chunk_digest(chunks: &[(u32, SealedRecord)]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"VLT1/CHUNK-DIGEST\0");
+    let mut digest = ChunkDigestBuilder::new();
     for (index, record) in chunks {
-        hasher.update(index.to_be_bytes());
-        hasher.update(record.nonce);
-        hasher.update((record.ciphertext.len() as u64).to_be_bytes());
-        hasher.update(&record.ciphertext);
+        digest.update(*index, record);
     }
-    hasher.finalize().into()
+    digest.finalize()
 }
 
 fn derive_passphrase_key(

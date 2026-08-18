@@ -54,6 +54,15 @@ pub(crate) struct Storage {
     connection: Connection,
 }
 
+/// An uncommitted immutable version receiving encrypted chunks incrementally.
+pub(crate) struct StreamingPublication<'connection> {
+    transaction: Transaction<'connection>,
+    object_id: ObjectId,
+    version_id: VersionId,
+    next_chunk_index: u32,
+    plaintext_len: u64,
+}
+
 impl Storage {
     /// Creates and initializes a new `SQLite` database at `path`.
     pub(crate) fn create(path: &Path, envelope: &RootEnvelope) -> Result<Self> {
@@ -166,6 +175,37 @@ impl Storage {
         chunks: &[EncryptedChunk],
     ) -> Result<()> {
         self.publish_inner(version, chunks, None)
+    }
+
+    /// Starts an uncommitted immutable version for incremental encrypted chunks.
+    ///
+    /// The placeholder row is visible only inside the transaction. Callers must
+    /// finish it with an authenticated Manifest before it can become active.
+    pub(crate) fn begin_streaming_publication(
+        &mut self,
+        object_id: ObjectId,
+        version_id: VersionId,
+        wrapped_dek: &SealedRecord,
+        chunk_size: u32,
+    ) -> Result<StreamingPublication<'_>> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| VaultError::Storage)?;
+        Self::insert_streaming_placeholder(
+            &transaction,
+            object_id,
+            version_id,
+            wrapped_dek,
+            chunk_size,
+        )?;
+        Ok(StreamingPublication {
+            transaction,
+            object_id,
+            version_id,
+            next_chunk_index: 0,
+            plaintext_len: 0,
+        })
     }
 
     /// Stages encrypted immutable data before its external witness acknowledgement.
@@ -474,8 +514,11 @@ impl Storage {
         })
     }
 
-    /// Loads chunks in their canonical ascending index order.
-    pub(crate) fn chunks(&self, version_id: VersionId) -> Result<Vec<EncryptedChunk>> {
+    /// Visits encrypted chunks in canonical ascending index order without retaining them.
+    pub(crate) fn visit_chunks<F>(&self, version_id: VersionId, mut visit: F) -> Result<()>
+    where
+        F: FnMut(EncryptedChunk) -> Result<()>,
+    {
         let mut statement = self
             .connection
             .prepare(
@@ -483,27 +526,22 @@ impl Storage {
                  WHERE version_id = ?1 ORDER BY chunk_index ASC",
             )
             .map_err(|_| VaultError::Storage)?;
-        let rows = statement
-            .query_map(params![version_id.as_bytes().as_slice()], |row| {
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            })
+        let mut rows = statement
+            .query(params![version_id.as_bytes().as_slice()])
             .map_err(|_| VaultError::Storage)?;
-        let mut chunks = Vec::new();
-        for row in rows {
-            let (index, nonce, ciphertext) = row.map_err(|_| VaultError::Storage)?;
-            chunks.push(EncryptedChunk {
+        while let Some(row) = rows.next().map_err(|_| VaultError::Storage)? {
+            let index = row.get::<_, u32>(0).map_err(|_| VaultError::Storage)?;
+            let nonce = row.get::<_, Vec<u8>>(1).map_err(|_| VaultError::Storage)?;
+            let ciphertext = row.get::<_, Vec<u8>>(2).map_err(|_| VaultError::Storage)?;
+            visit(EncryptedChunk {
                 index,
                 record: SealedRecord {
                     nonce: bytes12(&nonce)?,
                     ciphertext,
                 },
-            });
+            })?;
         }
-        Ok(chunks)
+        Ok(())
     }
 
     fn open_connection(path: &Path) -> Result<Self> {
@@ -645,6 +683,32 @@ impl Storage {
         Ok(())
     }
 
+    fn insert_streaming_placeholder(
+        transaction: &Transaction<'_>,
+        object_id: ObjectId,
+        version_id: VersionId,
+        wrapped_dek: &SealedRecord,
+        chunk_size: u32,
+    ) -> Result<()> {
+        transaction
+            .execute(
+                "INSERT INTO versions(version_id, object_id, wrapped_dek_nonce, wrapped_dek_ciphertext, \
+                 manifest_nonce, manifest_ciphertext, plaintext_len, chunk_size, chunk_count) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, 0)",
+                params![
+                    version_id.as_bytes().as_slice(),
+                    object_id.as_bytes().as_slice(),
+                    wrapped_dek.nonce.as_slice(),
+                    wrapped_dek.ciphertext,
+                    [0u8; 12].as_slice(),
+                    Vec::<u8>::new(),
+                    chunk_size,
+                ],
+            )
+            .map_err(|_| VaultError::Storage)?;
+        Ok(())
+    }
+
     fn insert_version(transaction: &Transaction<'_>, version: &StoredVersion) -> Result<()> {
         transaction
             .execute(
@@ -703,6 +767,65 @@ impl Storage {
             )
             .map_err(|_| VaultError::Storage)?;
         Ok(())
+    }
+}
+
+impl StreamingPublication<'_> {
+    /// Inserts the next encrypted chunk while preserving canonical index order.
+    pub(crate) fn append_chunk(
+        &mut self,
+        chunk: &EncryptedChunk,
+        plaintext_len: u32,
+    ) -> Result<()> {
+        if chunk.index != self.next_chunk_index {
+            return Err(VaultError::Invariant("streamed chunk index"));
+        }
+        Storage::insert_chunk(&self.transaction, self.version_id, chunk)?;
+        self.next_chunk_index = self
+            .next_chunk_index
+            .checked_add(1)
+            .ok_or(VaultError::Invariant("streamed chunk count"))?;
+        self.plaintext_len = self
+            .plaintext_len
+            .checked_add(u64::from(plaintext_len))
+            .ok_or(VaultError::Invariant("streamed plaintext length"))?;
+        Ok(())
+    }
+
+    /// Authenticates the final metadata, advances the active pointer, and commits.
+    pub(crate) fn finish(self, manifest: &SealedRecord, chunk_count: u32) -> Result<()> {
+        if chunk_count != self.next_chunk_index {
+            return Err(VaultError::Invariant("streamed Manifest chunk count"));
+        }
+        let changed = self
+            .transaction
+            .execute(
+                "UPDATE versions SET manifest_nonce = ?1, manifest_ciphertext = ?2, \
+                 plaintext_len = ?3, chunk_count = ?4 WHERE version_id = ?5 AND object_id = ?6",
+                params![
+                    manifest.nonce.as_slice(),
+                    manifest.ciphertext,
+                    self.plaintext_len,
+                    chunk_count,
+                    self.version_id.as_bytes().as_slice(),
+                    self.object_id.as_bytes().as_slice(),
+                ],
+            )
+            .map_err(|_| VaultError::Storage)?;
+        if changed != 1 {
+            return Err(VaultError::Invariant("streamed version finalization"));
+        }
+        self.transaction
+            .execute(
+                "INSERT INTO objects(object_id, active_version_id) VALUES(?1, ?2) \
+                 ON CONFLICT(object_id) DO UPDATE SET active_version_id = excluded.active_version_id",
+                params![
+                    self.object_id.as_bytes().as_slice(),
+                    self.version_id.as_bytes().as_slice(),
+                ],
+            )
+            .map_err(|_| VaultError::Storage)?;
+        self.transaction.commit().map_err(|_| VaultError::Storage)
     }
 }
 

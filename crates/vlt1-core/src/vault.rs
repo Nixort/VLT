@@ -4,7 +4,10 @@
 
 //! Capability-scoped VLT/1 operations.
 
-use std::path::Path;
+use std::{
+    io::{Read, Write},
+    path::Path,
+};
 
 use zeroize::{Zeroize, Zeroizing};
 
@@ -12,12 +15,11 @@ use crate::{
     cde::{decode_manifest, encode_manifest},
     crypto::{
         chunk_aad, chunk_digest, derive_kek, derive_manifest_key, generate_dek, generate_root_key,
-        manifest_aad, open, open_root_key, seal, seal_root_key, wrapped_dek_aad, KdfParams,
+        manifest_aad, open, open_root_key, seal, seal_root_key, wrapped_dek_aad,
+        ChunkDigestBuilder, KdfParams,
     },
     error::{Result, VaultError},
-    format::{
-        EncryptedChunk, Manifest, ObjectId, SealedRecord, VaultId, VersionId, FORMAT_VERSION,
-    },
+    format::{EncryptedChunk, Manifest, ObjectId, VaultId, VersionId, FORMAT_VERSION},
     storage::{Storage, StoredVersion},
     witness::{WitnessProvider, WitnessRequest},
 };
@@ -147,6 +149,42 @@ impl Vault {
         chunk_size: usize,
     ) -> Result<VersionId> {
         let result = self.put_inner(object_id, plaintext, chunk_size);
+        self.lock_after_failure(&result);
+        result
+    }
+
+    /// Encrypts and publishes one immutable version from a streaming plaintext reader.
+    ///
+    /// The reader is consumed in bounded plaintext chunks. Encrypted chunks are
+    /// retained only by the `SQLite` transaction, so input size does not determine
+    /// the vault process's peak plaintext allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault is locked, the reader fails, an input
+    /// exceeds the chunk policy, cryptographic processing fails, or publication
+    /// cannot commit.
+    pub fn put_from_reader<R: Read>(
+        &mut self,
+        object_id: ObjectId,
+        reader: &mut R,
+    ) -> Result<VersionId> {
+        self.put_from_reader_with_chunk_size(object_id, reader, DEFAULT_CHUNK_SIZE)
+    }
+
+    /// Streaming `put` variant with an explicit chunk size for tests and benchmarks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::put_from_reader`], plus an error for an
+    /// invalid chunk size.
+    pub fn put_from_reader_with_chunk_size<R: Read>(
+        &mut self,
+        object_id: ObjectId,
+        reader: &mut R,
+        chunk_size: usize,
+    ) -> Result<VersionId> {
+        let result = self.put_from_reader_inner(object_id, reader, chunk_size);
         self.lock_after_failure(&result);
         result
     }
@@ -288,6 +326,23 @@ impl Vault {
         result
     }
 
+    /// Verifies and writes the active immutable version to a plaintext sink.
+    ///
+    /// The caller receives data only after the encrypted chunk layout and digest
+    /// have been verified. A sink can still contain a verified prefix if a later
+    /// chunk fails authentication, so file callers should write to a temporary
+    /// path and publish it only after this operation succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault is locked, the object is absent, a reader
+    /// record fails verification, or the output sink cannot be written.
+    pub fn get_to_writer<W: Write>(&mut self, object_id: ObjectId, writer: &mut W) -> Result<()> {
+        let result = self.get_to_writer_inner(object_id, writer);
+        self.lock_after_failure(&result);
+        result
+    }
+
     /// Changes the passphrase while retaining the existing random Root Key.
     ///
     /// # Errors
@@ -326,6 +381,100 @@ impl Vault {
         self.storage
             .publish(&prepared.stored_version, &prepared.chunks)?;
         Ok(version_id)
+    }
+
+    fn put_from_reader_inner<R: Read>(
+        &mut self,
+        object_id: ObjectId,
+        reader: &mut R,
+        chunk_size: usize,
+    ) -> Result<VersionId> {
+        if chunk_size == 0 {
+            return Err(VaultError::InvalidInput("invalid chunk size"));
+        }
+        let chunk_size_u32 = u32::try_from(chunk_size)
+            .map_err(|_| VaultError::InvalidInput("invalid chunk size"))?;
+        let root_key = Zeroizing::new(*self.require_root_key()?);
+        let version_id = VersionId::random();
+        let mut data_key = generate_dek();
+        let result = (|| {
+            let mut wrapping_key = derive_kek(&root_key, self.envelope.vault_id)?;
+            let wrapped_dek = seal(
+                &wrapping_key[..],
+                &wrapped_dek_aad(self.envelope.vault_id, object_id, version_id),
+                &data_key[..],
+            )?;
+            wrapping_key.zeroize();
+
+            let mut publication = self.storage.begin_streaming_publication(
+                object_id,
+                version_id,
+                &wrapped_dek,
+                chunk_size_u32,
+            )?;
+            let mut buffer = Zeroizing::new(vec![0u8; chunk_size]);
+            let mut digest = ChunkDigestBuilder::new();
+            let mut chunk_count = 0u32;
+            let mut plaintext_len = 0u64;
+            loop {
+                let read = read_next_chunk(reader, &mut buffer[..])?;
+                if read == 0 {
+                    break;
+                }
+                if chunk_count >= MAX_CHUNKS_PER_VERSION {
+                    buffer[..read].zeroize();
+                    return Err(VaultError::InvalidInput("nonce budget exceeded"));
+                }
+                let chunk_len =
+                    u32::try_from(read).map_err(|_| VaultError::InvalidInput("chunk length"))?;
+                let aad = chunk_aad(
+                    self.envelope.vault_id,
+                    object_id,
+                    version_id,
+                    chunk_count,
+                    chunk_len,
+                );
+                let record = seal(&data_key[..], &aad, &buffer[..read])?;
+                buffer[..read].zeroize();
+                digest.update(chunk_count, &record);
+                publication.append_chunk(
+                    &EncryptedChunk {
+                        index: chunk_count,
+                        record,
+                    },
+                    chunk_len,
+                )?;
+                plaintext_len = plaintext_len
+                    .checked_add(u64::from(chunk_len))
+                    .ok_or(VaultError::InvalidInput("plaintext length exceeds u64"))?;
+                chunk_count = chunk_count
+                    .checked_add(1)
+                    .ok_or(VaultError::InvalidInput("too many chunks"))?;
+            }
+            buffer.zeroize();
+
+            let manifest = Manifest {
+                format_version: FORMAT_VERSION,
+                object_id,
+                version_id,
+                plaintext_len,
+                chunk_size: chunk_size_u32,
+                chunk_count,
+                chunk_digest: digest.finalize(),
+            };
+            let manifest_bytes = encode_manifest(&manifest);
+            let mut manifest_key = derive_manifest_key(&data_key, version_id)?;
+            let manifest = seal(
+                &manifest_key[..],
+                &manifest_aad(self.envelope.vault_id, object_id, version_id),
+                &manifest_bytes,
+            )?;
+            manifest_key.zeroize();
+            publication.finish(&manifest, chunk_count)?;
+            Ok(version_id)
+        })();
+        data_key.zeroize();
+        result
     }
 
     fn put_with_witness_inner<P: WitnessProvider>(
@@ -384,8 +533,8 @@ impl Vault {
         let _ = self.require_root_key()?;
         let object_ids = self.storage.active_object_ids()?;
         for object_id in &object_ids {
-            let mut plaintext = self.get_inner(*object_id)?;
-            plaintext.zeroize();
+            let mut sink = std::io::sink();
+            self.get_to_writer_inner(*object_id, &mut sink)?;
         }
         u64::try_from(object_ids.len())
             .map_err(|_| VaultError::Invariant("active object count exceeds u64"))
@@ -412,8 +561,8 @@ impl Vault {
             {
                 return Err(VaultError::WitnessConflict);
             }
-            let mut plaintext = self.get_inner(*object_id)?;
-            plaintext.zeroize();
+            let mut sink = std::io::sink();
+            self.get_to_writer_inner(*object_id, &mut sink)?;
         }
         u64::try_from(object_ids.len())
             .map_err(|_| VaultError::Invariant("active object count exceeds u64"))
@@ -506,6 +655,12 @@ impl Vault {
     }
 
     fn get_inner(&mut self, object_id: ObjectId) -> Result<Vec<u8>> {
+        let mut plaintext = Vec::new();
+        self.get_to_writer_inner(object_id, &mut plaintext)?;
+        Ok(plaintext)
+    }
+
+    fn get_to_writer_inner<W: Write>(&mut self, object_id: ObjectId, writer: &mut W) -> Result<()> {
         let root_key = self.require_root_key()?;
         let version = self.storage.active_version(object_id)?;
         if version.object_id != object_id {
@@ -524,65 +679,79 @@ impl Vault {
             .map_err(|_| VaultError::invalid_format("wrapped DEK length"))?;
         data_key_bytes.zeroize();
         let mut data_key = Zeroizing::new(data_key);
-
-        let mut manifest_key = derive_manifest_key(&data_key, version.version_id)?;
-        let mut manifest_bytes = open(
-            &manifest_key[..],
-            &manifest_aad(self.envelope.vault_id, object_id, version.version_id),
-            &version.manifest,
-        )?;
-        manifest_key.zeroize();
-        let manifest = decode_manifest(&manifest_bytes)?;
-        manifest_bytes.zeroize();
-        validate_manifest_binding(&manifest, &version)?;
-        if let Some(receipt) = self.storage.receipt(version.version_id)? {
-            let request = WitnessRequest::new(
-                self.envelope.vault_id,
-                object_id,
-                version.version_id,
+        let result = (|| {
+            let mut manifest_key = derive_manifest_key(&data_key, version.version_id)?;
+            let mut manifest_bytes = open(
+                &manifest_key[..],
+                &manifest_aad(self.envelope.vault_id, object_id, version.version_id),
                 &version.manifest,
-            );
-            receipt.verify_request(&request)?;
-        }
-
-        let chunks = self.storage.chunks(version.version_id)?;
-        validate_chunk_layout(&manifest, &chunks)?;
-        let digest_input: Vec<(u32, SealedRecord)> = chunks
-            .iter()
-            .map(|chunk| (chunk.index, chunk.record.clone()))
-            .collect();
-        if chunk_digest(&digest_input) != manifest.chunk_digest {
-            return Err(VaultError::Authentication);
-        }
-
-        let expected_len = usize::try_from(manifest.plaintext_len)
-            .map_err(|_| VaultError::invalid_format("plaintext length exceeds usize"))?;
-        let mut plaintext = Vec::with_capacity(expected_len);
-        for chunk in chunks {
-            let expected_chunk_len = expected_plaintext_chunk_len(&manifest, chunk.index)?;
-            let aad = chunk_aad(
-                self.envelope.vault_id,
-                object_id,
-                version.version_id,
-                chunk.index,
-                expected_chunk_len,
-            );
-            let mut part = open(&data_key[..], &aad, &chunk.record)?;
-            if part.len() != expected_chunk_len as usize {
-                part.zeroize();
-                return Err(VaultError::invalid_format("authenticated chunk length"));
+            )?;
+            manifest_key.zeroize();
+            let manifest = decode_manifest(&manifest_bytes)?;
+            manifest_bytes.zeroize();
+            validate_manifest_binding(&manifest, &version)?;
+            if let Some(receipt) = self.storage.receipt(version.version_id)? {
+                let request = WitnessRequest::new(
+                    self.envelope.vault_id,
+                    object_id,
+                    version.version_id,
+                    &version.manifest,
+                );
+                receipt.verify_request(&request)?;
             }
-            plaintext.extend_from_slice(&part);
-            part.zeroize();
-        }
+
+            let mut digest = ChunkDigestBuilder::new();
+            let mut expected_index = 0u32;
+            self.storage.visit_chunks(version.version_id, |chunk| {
+                if chunk.index != expected_index {
+                    return Err(VaultError::Invariant("stored chunk indices"));
+                }
+                digest.update(chunk.index, &chunk.record);
+                expected_index = expected_index
+                    .checked_add(1)
+                    .ok_or(VaultError::Invariant("stored chunk count"))?;
+                Ok(())
+            })?;
+            if expected_index != manifest.chunk_count {
+                return Err(VaultError::Invariant("stored chunk count"));
+            }
+            if digest.finalize() != manifest.chunk_digest {
+                return Err(VaultError::Authentication);
+            }
+
+            let mut written_len = 0u64;
+            self.storage.visit_chunks(version.version_id, |chunk| {
+                let expected_chunk_len = expected_plaintext_chunk_len(&manifest, chunk.index)?;
+                let aad = chunk_aad(
+                    self.envelope.vault_id,
+                    object_id,
+                    version.version_id,
+                    chunk.index,
+                    expected_chunk_len,
+                );
+                let mut part = open(&data_key[..], &aad, &chunk.record)?;
+                if part.len() != expected_chunk_len as usize {
+                    part.zeroize();
+                    return Err(VaultError::invalid_format("authenticated chunk length"));
+                }
+                writer.write_all(&part).map_err(|_| VaultError::Storage)?;
+                written_len = written_len
+                    .checked_add(u64::from(expected_chunk_len))
+                    .ok_or(VaultError::Invariant(
+                        "plaintext length after chunk assembly",
+                    ))?;
+                part.zeroize();
+                Ok(())
+            })?;
+            if written_len != manifest.plaintext_len {
+                return Err(VaultError::Invariant(
+                    "plaintext length after chunk assembly",
+                ));
+            }
+            Ok(())
+        })();
         data_key.zeroize();
-        if plaintext.len() != expected_len {
-            plaintext.zeroize();
-            return Err(VaultError::Invariant(
-                "plaintext length after chunk assembly",
-            ));
-        }
-        Ok(plaintext)
+        result
     }
 
     fn require_root_key(&self) -> Result<&[u8; 32]> {
@@ -596,6 +765,22 @@ impl Vault {
             }
         }
     }
+}
+
+fn read_next_chunk<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                buffer[..filled].zeroize();
+                return Err(VaultError::Storage);
+            }
+        }
+    }
+    Ok(filled)
 }
 
 fn validate_passphrase(passphrase: &str) -> Result<()> {
@@ -619,20 +804,6 @@ fn validate_manifest_binding(manifest: &Manifest, stored: &StoredVersion) -> Res
     }
     if manifest.chunk_size == 0 || manifest.chunk_count > MAX_CHUNKS_PER_VERSION {
         return Err(VaultError::invalid_format("Manifest chunk policy"));
-    }
-    Ok(())
-}
-
-fn validate_chunk_layout(manifest: &Manifest, chunks: &[EncryptedChunk]) -> Result<()> {
-    if chunks.len() != manifest.chunk_count as usize {
-        return Err(VaultError::Invariant("stored chunk count"));
-    }
-    for (expected, chunk) in chunks.iter().enumerate() {
-        let expected = u32::try_from(expected)
-            .map_err(|_| VaultError::Invariant("stored chunk index exceeds u32"))?;
-        if chunk.index != expected {
-            return Err(VaultError::Invariant("stored chunk indices"));
-        }
     }
     Ok(())
 }

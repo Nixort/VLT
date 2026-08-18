@@ -4,6 +4,8 @@
 
 //! Regression tests for VLT/1 lifecycle and tamper-detection invariants.
 
+use std::io::Read;
+
 use rusqlite::Connection;
 use tempfile::tempdir;
 use vlt1_core::{ObjectId, Vault, VaultError, VaultStatus};
@@ -13,6 +15,37 @@ fn create_vault() -> (tempfile::TempDir, std::path::PathBuf, Vault) {
     let path = directory.path().join("vault.sqlite");
     let vault = Vault::create(&path, "correct horse battery staple").expect("vault initialization");
     (directory, path, vault)
+}
+
+struct FragmentedReader {
+    bytes: Vec<u8>,
+    offset: usize,
+    maximum_read: usize,
+}
+
+impl FragmentedReader {
+    fn new(bytes: Vec<u8>, maximum_read: usize) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            maximum_read,
+        }
+    }
+}
+
+impl Read for FragmentedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.offset == self.bytes.len() {
+            return Ok(0);
+        }
+        let read = self
+            .maximum_read
+            .min(buffer.len())
+            .min(self.bytes.len() - self.offset);
+        buffer[..read].copy_from_slice(&self.bytes[self.offset..self.offset + read]);
+        self.offset += read;
+        Ok(read)
+    }
 }
 
 #[test]
@@ -26,6 +59,54 @@ fn immutable_versions_round_trip_and_advance_the_active_pointer() {
     let second_version = vault.put(object, b"second value").expect("second write");
     assert_ne!(first_version, second_version);
     assert_eq!(vault.get(object).expect("active read"), b"second value");
+}
+
+#[test]
+fn streaming_round_trip_handles_fragmented_readers_and_bounded_chunks() {
+    let (_directory, _path, mut vault) = create_vault();
+    let object = ObjectId::random();
+    let payload: Vec<u8> = (0usize..(32 * 1024 + 37))
+        .map(|index| u8::try_from(index % 251).expect("bounded byte fixture"))
+        .collect();
+    let mut reader = FragmentedReader::new(payload.clone(), 97);
+
+    vault
+        .put_from_reader_with_chunk_size(object, &mut reader, 1024)
+        .expect("streaming write");
+    let mut recovered = Vec::new();
+    vault
+        .get_to_writer(object, &mut recovered)
+        .expect("streaming read");
+
+    assert_eq!(recovered, payload);
+}
+
+#[test]
+fn streaming_read_writes_nothing_before_digest_verification() {
+    let (_directory, path, mut vault) = create_vault();
+    let object = ObjectId::random();
+    vault
+        .put_from_reader_with_chunk_size(object, &mut std::io::Cursor::new(vec![7; 4096]), 1024)
+        .expect("streaming write");
+    drop(vault);
+
+    let connection = Connection::open(&path).expect("open SQLite for tamper fixture");
+    connection
+        .execute(
+            "UPDATE chunks SET ciphertext = zeroblob(length(ciphertext)) WHERE chunk_index = 0",
+            [],
+        )
+        .expect("tamper first ciphertext");
+    drop(connection);
+
+    let mut reopened = Vault::open(path).expect("reopen tampered vault");
+    reopened
+        .unlock("correct horse battery staple")
+        .expect("unlock before streaming verification");
+    let mut output = Vec::new();
+    assert!(reopened.get_to_writer(object, &mut output).is_err());
+    assert!(output.is_empty());
+    assert_eq!(reopened.status(), VaultStatus::Locked);
 }
 
 #[test]
