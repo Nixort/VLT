@@ -32,7 +32,12 @@ use nix::{
     unistd::Uid,
 };
 use vlt1_core::{HttpsWitnessProvider, ObjectId, Vault, VaultError, VaultStatus};
-use vlt1_protocol::{read_frame, write_frame, ErrorCode, Failure, Request, Response, Success};
+use vlt1_protocol::{
+    read_frame, read_stream_item, write_frame, write_stream_chunk, write_stream_end,
+    write_stream_error, ErrorCode, Failure, Request, Response, StreamItem, Success,
+    MAX_STREAM_CHUNK_BYTES,
+};
+use zeroize::Zeroize;
 
 const DEFAULT_MAX_CONNECTIONS: usize = 32;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -105,6 +110,17 @@ struct RecoveryState {
 
 struct ConnectionPermit {
     state: Arc<DaemonState>,
+}
+
+struct StreamReader<'stream> {
+    stream: &'stream mut UnixStream,
+    current: Vec<u8>,
+    offset: usize,
+    finished: bool,
+}
+
+struct StreamWriter<'stream> {
+    stream: &'stream mut UnixStream,
 }
 
 impl Drop for ConnectionPermit {
@@ -191,19 +207,25 @@ impl Daemon {
     pub fn serve_stream(&self, mut stream: UnixStream) -> io::Result<()> {
         stream.set_read_timeout(Some(self.state.config.io_timeout))?;
         stream.set_write_timeout(Some(self.state.config.io_timeout))?;
-        let response = match self.authorize(&stream) {
+        match self.authorize(&stream) {
             Ok(()) => match read_frame::<Request, _>(&mut stream) {
-                Ok(request) => self.dispatch(request),
-                Err(_) => Response::Error {
-                    error: failure(ErrorCode::Protocol, "invalid local protocol request"),
+                Ok(Request::PutStream { object_id }) => self.put_stream(&mut stream, &object_id),
+                Ok(Request::GetStream { object_id }) => self.get_stream(&mut stream, &object_id),
+                Ok(request) => write_response(&mut stream, &self.dispatch(request)),
+                Err(_) => write_response(
+                    &mut stream,
+                    &Response::Error {
+                        error: failure(ErrorCode::Protocol, "invalid local protocol request"),
+                    },
+                ),
+            },
+            Err(()) => write_response(
+                &mut stream,
+                &Response::Error {
+                    error: failure(ErrorCode::Unauthorized, "local peer is not authorized"),
                 },
-            },
-            Err(()) => Response::Error {
-                error: failure(ErrorCode::Unauthorized, "local peer is not authorized"),
-            },
-        };
-        write_frame(&mut stream, &response)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "response write failed"))
+            ),
+        }
     }
 
     fn try_acquire_connection(&self) -> Option<ConnectionPermit> {
@@ -252,6 +274,12 @@ impl Daemon {
                 plaintext_b64,
             } => self.put(&object_id, &plaintext_b64),
             Request::Get { object_id } => self.get(&object_id),
+            Request::PutStream { .. } | Request::GetStream { .. } => Response::Error {
+                error: failure(
+                    ErrorCode::Protocol,
+                    "streaming request was not handled as a stream",
+                ),
+            },
             Request::RotatePassphrase {
                 current_passphrase,
                 replacement_passphrase,
@@ -389,6 +417,80 @@ impl Daemon {
         }
     }
 
+    fn put_stream(&self, stream: &mut UnixStream, object_id: &str) -> io::Result<()> {
+        let object_id = match parse_object_id(object_id) {
+            Ok(object_id) => object_id,
+            Err(response) => return write_response(stream, &response),
+        };
+        write_response(
+            stream,
+            &Response::Ok {
+                result: Success::StreamReady,
+            },
+        )?;
+        let result = {
+            let Ok(mut vault) = self.state.vault.lock() else {
+                return write_stream_failure(
+                    stream,
+                    ErrorCode::Internal,
+                    "daemon state is unavailable",
+                );
+            };
+            let mut reader = StreamReader::new(stream);
+            vault.put_from_reader(object_id, &mut reader)
+        };
+        match result {
+            Ok(version_id) => write_response(
+                stream,
+                &Response::Ok {
+                    result: Success::Published {
+                        version_id: version_id.to_hex(),
+                    },
+                },
+            ),
+            Err(error) => write_stream_response(
+                stream,
+                &Response::Error {
+                    error: map_vault_error(&error),
+                },
+            ),
+        }
+    }
+
+    fn get_stream(&self, stream: &mut UnixStream, object_id: &str) -> io::Result<()> {
+        let object_id = match parse_object_id(object_id) {
+            Ok(object_id) => object_id,
+            Err(response) => return write_response(stream, &response),
+        };
+        write_response(
+            stream,
+            &Response::Ok {
+                result: Success::StreamReady,
+            },
+        )?;
+        let result = {
+            let Ok(mut vault) = self.state.vault.lock() else {
+                return write_stream_failure(
+                    stream,
+                    ErrorCode::Internal,
+                    "daemon state is unavailable",
+                );
+            };
+            let mut writer = StreamWriter::new(stream);
+            vault.get_to_writer(object_id, &mut writer)
+        };
+        match result {
+            Ok(()) => write_stream_end(stream)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stream end write failed")),
+            Err(error) => write_stream_response(
+                stream,
+                &Response::Error {
+                    error: map_vault_error(&error),
+                },
+            ),
+        }
+    }
+
     fn get(&self, object_id: &str) -> Response {
         let object_id = match parse_object_id(object_id) {
             Ok(object_id) => object_id,
@@ -477,6 +579,103 @@ impl Daemon {
             },
         }
     }
+}
+
+impl Drop for StreamReader<'_> {
+    fn drop(&mut self) {
+        self.current.zeroize();
+    }
+}
+
+impl StreamReader<'_> {
+    fn new(stream: &mut UnixStream) -> StreamReader<'_> {
+        StreamReader {
+            stream,
+            current: Vec::new(),
+            offset: 0,
+            finished: false,
+        }
+    }
+}
+
+impl io::Read for StreamReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        while self.offset == self.current.len() {
+            self.current.zeroize();
+            self.current.clear();
+            self.offset = 0;
+            if self.finished {
+                return Ok(0);
+            }
+            match read_stream_item(self.stream) {
+                Ok(StreamItem::Data(data)) => self.current = data,
+                Ok(StreamItem::End) => {
+                    self.finished = true;
+                    return Ok(0);
+                }
+                Ok(StreamItem::Error(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "client aborted binary stream",
+                    ));
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid binary stream frame",
+                    ));
+                }
+            }
+        }
+        let available = &self.current[self.offset..];
+        let copied = available.len().min(buffer.len());
+        buffer[..copied].copy_from_slice(&available[..copied]);
+        self.offset += copied;
+        Ok(copied)
+    }
+}
+
+impl StreamWriter<'_> {
+    fn new(stream: &mut UnixStream) -> StreamWriter<'_> {
+        StreamWriter { stream }
+    }
+}
+
+impl io::Write for StreamWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        for chunk in buffer.chunks(MAX_STREAM_CHUNK_BYTES) {
+            write_stream_chunk(self.stream, chunk).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "binary stream write failed")
+            })?;
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_response(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
+    write_frame(stream, response)
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "response write failed"))
+}
+
+fn write_stream_response(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
+    write_stream_error(stream, response)
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stream error write failed"))
+}
+
+fn write_stream_failure(stream: &mut UnixStream, code: ErrorCode, message: &str) -> io::Result<()> {
+    write_stream_response(
+        stream,
+        &Response::Error {
+            error: failure(code, message),
+        },
+    )
 }
 
 fn reject_overloaded(stream: &mut UnixStream) {

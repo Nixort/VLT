@@ -6,18 +6,21 @@
 
 use std::{
     fs::{self, File},
-    io::Write,
+    io::{Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use rpassword::prompt_password;
 use tempfile::NamedTempFile;
 use vlt1_core::{manifest_path, BackupManifest, Vault};
-use vlt1_protocol::{read_frame, write_frame, Request, Response, Success};
+use vlt1_protocol::{
+    read_frame, read_stream_item, write_frame, write_stream_chunk, write_stream_end, Request,
+    Response, StreamItem, Success, MAX_STREAM_CHUNK_BYTES,
+};
+use zeroize::Zeroize;
 
 #[derive(Debug, Parser)]
 #[command(name = "vlt1", version, about = "VLT/1 local daemon client")]
@@ -193,40 +196,98 @@ fn unlock(socket: &Path) -> Result<()> {
 }
 
 fn put(socket: &Path, object_id: &str, input: &Path) -> Result<()> {
-    let plaintext =
-        fs::read(input).with_context(|| format!("could not read {}", input.display()))?;
-    match request(
-        socket,
-        &Request::Put {
+    let mut file =
+        File::open(input).with_context(|| format!("could not read {}", input.display()))?;
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("could not connect to {}", socket.display()))?;
+    write_frame(
+        &mut stream,
+        &Request::PutStream {
             object_id: object_id.to_owned(),
-            plaintext_b64: STANDARD.encode(plaintext),
         },
-    )? {
+    )
+    .context("could not start streaming upload")?;
+    expect_stream_ready(&read_response(&mut stream)?)?;
+
+    let mut buffer = zeroize::Zeroizing::new(vec![0u8; MAX_STREAM_CHUNK_BYTES]);
+    loop {
+        let read = file
+            .read(&mut buffer[..])
+            .with_context(|| format!("could not read {}", input.display()))?;
+        if read == 0 {
+            break;
+        }
+        write_stream_chunk(&mut stream, &buffer[..read]).context("could not write upload chunk")?;
+        buffer[..read].zeroize();
+    }
+    write_stream_end(&mut stream).context("could not finish streaming upload")?;
+
+    match read_response(&mut stream)? {
         Success::Published { version_id } => {
             println!("published immutable version: {version_id}");
             Ok(())
         }
-        _ => bail!("daemon returned an unexpected put payload"),
+        _ => bail!("daemon returned an unexpected streaming upload payload"),
     }
 }
 
 fn get(socket: &Path, object_id: &str, output: &Path) -> Result<()> {
-    match request(
-        socket,
-        &Request::Get {
+    let parent = output
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .context("plaintext output parent directory does not exist")?;
+    let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "could not create temporary output beside {}",
+            output.display()
+        )
+    })?;
+    temporary
+        .as_file_mut()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| {
+            format!(
+                "could not protect temporary output for {}",
+                output.display()
+            )
+        })?;
+
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("could not connect to {}", socket.display()))?;
+    write_frame(
+        &mut stream,
+        &Request::GetStream {
             object_id: object_id.to_owned(),
         },
-    )? {
-        Success::Plaintext { plaintext_b64 } => {
-            let plaintext = STANDARD
-                .decode(plaintext_b64)
-                .context("daemon returned invalid plaintext base64")?;
-            write_new_plaintext(output, &plaintext)?;
-            println!("verified and wrote {}", output.display());
-            Ok(())
+    )
+    .context("could not start streaming download")?;
+    expect_stream_ready(&read_response(&mut stream)?)?;
+
+    loop {
+        match read_stream_item(&mut stream).context("could not read download chunk")? {
+            StreamItem::Data(mut chunk) => {
+                let write_result = temporary.write_all(&chunk).with_context(|| {
+                    format!("could not write temporary output for {}", output.display())
+                });
+                chunk.zeroize();
+                write_result?;
+            }
+            StreamItem::End => break,
+            StreamItem::Error(Response::Error { error }) => {
+                bail!("daemon {}: {}", error.code_to_text(), error.message)
+            }
+            StreamItem::Error(Response::Ok { .. }) => {
+                bail!("daemon returned an invalid successful stream error response")
+            }
         }
-        _ => bail!("daemon returned an unexpected get payload"),
     }
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("could not sync temporary output for {}", output.display()))?;
+    publish_private_temporary_file(&temporary, output)?;
+    println!("verified and wrote {}", output.display());
+    Ok(())
 }
 
 fn backup(socket: &Path, output: &Path) -> Result<()> {
@@ -267,6 +328,15 @@ fn restore(backup: &Path, manifest: Option<&Path>, output: &Path) -> Result<()> 
     Ok(())
 }
 
+fn expect_stream_ready(response: &Success) -> Result<()> {
+    if *response == Success::StreamReady {
+        Ok(())
+    } else {
+        bail!("daemon returned an unexpected streaming readiness payload")
+    }
+}
+
+#[cfg(test)]
 fn write_new_plaintext(output: &Path, plaintext: &[u8]) -> Result<()> {
     let parent = output
         .parent()
@@ -294,6 +364,14 @@ fn write_new_plaintext(output: &Path, plaintext: &[u8]) -> Result<()> {
         .as_file()
         .sync_all()
         .with_context(|| format!("could not sync temporary output for {}", output.display()))?;
+    publish_private_temporary_file(&temporary, output)
+}
+
+fn publish_private_temporary_file(temporary: &NamedTempFile, output: &Path) -> Result<()> {
+    let parent = output
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .context("plaintext output parent directory does not exist")?;
     fs::hard_link(temporary.path(), output).with_context(|| {
         format!(
             "refusing to overwrite plaintext output: {}",
@@ -348,7 +426,16 @@ fn request(socket: &Path, operation: &Request) -> Result<Success> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("could not connect to {}", socket.display()))?;
     write_frame(&mut stream, operation).context("could not write daemon request")?;
-    match read_frame::<Response, _>(&mut stream).context("could not read daemon response")? {
+    read_response(&mut stream)
+}
+
+fn read_response(stream: &mut UnixStream) -> Result<Success> {
+    let response = read_frame::<Response, _>(stream).context("could not read daemon response")?;
+    response_to_result(response)
+}
+
+fn response_to_result(response: Response) -> Result<Success> {
+    match response {
         Response::Ok { result } => Ok(result),
         Response::Error { error } => bail!("daemon {}: {}", error.code_to_text(), error.message),
     }
@@ -429,5 +516,69 @@ mod tests {
             fs::read(&output).expect("read existing output"),
             b"existing plaintext"
         );
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use std::{
+        fs, thread,
+        time::{Duration, Instant},
+    };
+
+    use tempfile::tempdir;
+    use vlt1_core::Vault;
+    use vlt1_daemon::{Daemon, DaemonConfig};
+    use vlt1_protocol::{Request, Success};
+
+    use super::{get, put, request};
+
+    #[test]
+    fn cli_streams_file_round_trip_without_base64_payloads() {
+        let directory = tempdir().expect("temporary directory");
+        let vault_path = directory.path().join("vault.sqlite");
+        let socket_path = directory.path().join("vlt1.sock");
+        Vault::create(&vault_path, "correct horse battery staple").expect("vault creation");
+
+        let mut config = DaemonConfig::for_current_user(socket_path.clone(), vault_path);
+        config.allow_shutdown = true;
+        let daemon = Daemon::open(config).expect("daemon open");
+        let server = {
+            let daemon = daemon.clone();
+            thread::spawn(move || daemon.serve().expect("daemon serve"))
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !socket_path.exists() {
+            assert!(Instant::now() < deadline, "daemon socket did not appear");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            request(
+                &socket_path,
+                &Request::Unlock {
+                    passphrase: "correct horse battery staple".to_owned(),
+                },
+            )
+            .expect("unlock daemon"),
+            Success::Empty
+        );
+
+        let input = directory.path().join("input.bin");
+        let output = directory.path().join("output.bin");
+        let payload: Vec<u8> = (0usize..(5 * 1024 * 1024 + 23))
+            .map(|index| u8::try_from(index % 251).expect("bounded byte fixture"))
+            .collect();
+        fs::write(&input, &payload).expect("write input fixture");
+        let object_id = "ab".repeat(16);
+
+        put(&socket_path, &object_id, &input).expect("CLI streaming put");
+        get(&socket_path, &object_id, &output).expect("CLI streaming get");
+        assert_eq!(fs::read(&output).expect("read recovered output"), payload);
+
+        assert_eq!(
+            request(&socket_path, &Request::Shutdown).expect("shutdown daemon"),
+            Success::Empty
+        );
+        server.join().expect("daemon thread join");
     }
 }

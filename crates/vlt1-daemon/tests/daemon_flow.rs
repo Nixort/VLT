@@ -15,7 +15,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tempfile::tempdir;
 use vlt1_core::{manifest_path, BackupManifest, ObjectId, Vault};
 use vlt1_daemon::{Daemon, DaemonConfig};
-use vlt1_protocol::{read_frame, write_frame, ErrorCode, Request, Response, Success};
+use vlt1_protocol::{
+    read_frame, read_stream_item, write_frame, write_stream_chunk, write_stream_end, ErrorCode,
+    Request, Response, StreamItem, Success,
+};
 
 #[test]
 fn authorised_local_client_executes_a_full_vault_flow() {
@@ -115,6 +118,88 @@ fn authorised_local_client_executes_a_full_vault_flow() {
     assert_eq!(call(&socket_path, &Request::Shutdown), Success::Empty);
     server.join().expect("daemon thread join");
     assert!(daemon.shutdown_requested());
+}
+
+#[test]
+fn binary_streaming_round_trip_exceeds_legacy_base64_frame_limit() {
+    let directory = tempdir().expect("temporary directory");
+    let vault_path = directory.path().join("vault.sqlite");
+    let socket_path = directory.path().join("vlt1.sock");
+    Vault::create(&vault_path, "correct horse battery staple").expect("vault creation");
+
+    let mut config = DaemonConfig::for_current_user(socket_path.clone(), vault_path);
+    config.allow_shutdown = true;
+    let daemon = Daemon::open(config).expect("daemon open");
+    let server = {
+        let daemon = daemon.clone();
+        thread::spawn(move || daemon.serve().expect("daemon serve"))
+    };
+    wait_for_socket(&socket_path);
+    assert_eq!(
+        call(
+            &socket_path,
+            &Request::Unlock {
+                passphrase: "correct horse battery staple".to_owned(),
+            },
+        ),
+        Success::Empty
+    );
+
+    let object_id = ObjectId::random().to_hex();
+    let payload: Vec<u8> = (0usize..(17 * 1024 * 1024 + 31))
+        .map(|index| u8::try_from(index % 251).expect("bounded byte fixture"))
+        .collect();
+    let mut upload = UnixStream::connect(&socket_path).expect("connect streaming upload");
+    write_frame(
+        &mut upload,
+        &Request::PutStream {
+            object_id: object_id.clone(),
+        },
+    )
+    .expect("start streaming upload");
+    assert_eq!(
+        read_frame::<Response, _>(&mut upload).expect("upload ready"),
+        Response::Ok {
+            result: Success::StreamReady
+        }
+    );
+    for chunk in payload.chunks(1024 * 1024) {
+        write_stream_chunk(&mut upload, chunk).expect("write binary upload chunk");
+    }
+    write_stream_end(&mut upload).expect("finish binary upload");
+    assert!(matches!(
+        read_frame::<Response, _>(&mut upload).expect("upload completion"),
+        Response::Ok {
+            result: Success::Published { .. }
+        }
+    ));
+
+    let mut download = UnixStream::connect(&socket_path).expect("connect streaming download");
+    write_frame(
+        &mut download,
+        &Request::GetStream {
+            object_id: object_id.clone(),
+        },
+    )
+    .expect("start streaming download");
+    assert_eq!(
+        read_frame::<Response, _>(&mut download).expect("download ready"),
+        Response::Ok {
+            result: Success::StreamReady
+        }
+    );
+    let mut recovered = Vec::new();
+    loop {
+        match read_stream_item(&mut download).expect("read binary download item") {
+            StreamItem::Data(chunk) => recovered.extend_from_slice(&chunk),
+            StreamItem::End => break,
+            StreamItem::Error(response) => panic!("daemon stream error: {response:?}"),
+        }
+    }
+    assert_eq!(recovered, payload);
+
+    assert_eq!(call(&socket_path, &Request::Shutdown), Success::Empty);
+    server.join().expect("daemon thread join");
 }
 
 #[test]
