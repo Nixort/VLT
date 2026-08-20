@@ -983,8 +983,72 @@ pub fn random_witness_challenge() -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::{random_witness_challenge, InMemoryTestProvider, WitnessProvider, WitnessRequest};
+    use super::{
+        head_signing_bytes, random_witness_challenge, receipt_signing_bytes, InMemoryTestProvider,
+        WitnessProvider, WitnessRequest,
+    };
     use crate::{format::SealedRecord, ObjectId, VaultError, VaultId, VersionId};
+
+    #[test]
+    fn canonical_receipt_and_head_signing_bytes_match_fixed_vectors() {
+        let vault = VaultId::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+            .expect("fixed vault ID");
+        let object = ObjectId::from_slice(&[
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        ])
+        .expect("fixed object ID");
+        let version = VersionId::from_slice(&[
+            32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        ])
+        .expect("fixed version ID");
+        let commitment = [0xa5; 32];
+        let challenge = [0x5a; 32];
+
+        let mut expected_receipt = b"VLT/1 witness receipt v1".to_vec();
+        expected_receipt.extend_from_slice(vault.as_bytes());
+        expected_receipt.extend_from_slice(object.as_bytes());
+        expected_receipt.extend_from_slice(version.as_bytes());
+        expected_receipt.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        expected_receipt.extend_from_slice(&commitment);
+        assert_eq!(
+            receipt_signing_bytes(vault, object, version, 0x0102_0304_0506_0708, &commitment),
+            expected_receipt
+        );
+
+        let mut expected_present_head = b"VLT/1 witness head v1".to_vec();
+        expected_present_head.extend_from_slice(vault.as_bytes());
+        expected_present_head.extend_from_slice(object.as_bytes());
+        expected_present_head.push(1);
+        expected_present_head.extend_from_slice(version.as_bytes());
+        expected_present_head.extend_from_slice(&9u64.to_be_bytes());
+        expected_present_head.extend_from_slice(&commitment);
+        expected_present_head.extend_from_slice(&challenge);
+        assert_eq!(
+            head_signing_bytes(
+                vault,
+                object,
+                true,
+                Some(version),
+                9,
+                Some(&commitment),
+                &challenge
+            ),
+            expected_present_head
+        );
+
+        let mut expected_absent_head = b"VLT/1 witness head v1".to_vec();
+        expected_absent_head.extend_from_slice(vault.as_bytes());
+        expected_absent_head.extend_from_slice(object.as_bytes());
+        expected_absent_head.push(0);
+        expected_absent_head.extend_from_slice(&[0; 16]);
+        expected_absent_head.extend_from_slice(&0u64.to_be_bytes());
+        expected_absent_head.extend_from_slice(&[0; 32]);
+        expected_absent_head.extend_from_slice(&challenge);
+        assert_eq!(
+            head_signing_bytes(vault, object, false, None, 0, None, &challenge),
+            expected_absent_head
+        );
+    }
 
     #[test]
     fn issued_receipt_and_challenge_bound_head_verify() {

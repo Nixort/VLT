@@ -97,10 +97,11 @@ impl KdfParams {
 #[cfg(test)]
 mod tests {
     use super::{
-        open_root_key, seal_root_key, KdfParams, DEFAULT_ARGON2_ITERATIONS, DEFAULT_ARGON2_LANES,
-        DEFAULT_ARGON2_MEMORY_KIB, MAX_ARGON2_ITERATIONS, MAX_ARGON2_MEMORY_KIB,
+        chunk_aad, chunk_digest, manifest_aad, open_root_key, seal_root_key, wrapped_dek_aad,
+        KdfParams, DEFAULT_ARGON2_ITERATIONS, DEFAULT_ARGON2_LANES, DEFAULT_ARGON2_MEMORY_KIB,
+        MAX_ARGON2_ITERATIONS, MAX_ARGON2_MEMORY_KIB,
     };
-    use crate::{format::VaultId, VaultError};
+    use crate::{format::SealedRecord, ObjectId, VaultError, VaultId, VersionId};
 
     #[test]
     fn interactive_profile_matches_the_documented_rfc_9106_64_mib_profile() {
@@ -141,6 +142,62 @@ mod tests {
             parameters.validate_for_creation(),
             Err(VaultError::InvalidInput("Argon2id KDF parameter policy"))
         ));
+    }
+
+    #[test]
+    fn aad_transcripts_and_chunk_digest_match_fixed_vectors() {
+        let vault = VaultId::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+            .expect("fixed vault ID");
+        let object = ObjectId::from_slice(&[
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        ])
+        .expect("fixed object ID");
+        let version = VersionId::from_slice(&[
+            32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        ])
+        .expect("fixed version ID");
+
+        let mut expected_chunk_aad = b"VLT1/CHUNK\0".to_vec();
+        expected_chunk_aad.extend_from_slice(vault.as_bytes());
+        expected_chunk_aad.extend_from_slice(object.as_bytes());
+        expected_chunk_aad.extend_from_slice(version.as_bytes());
+        expected_chunk_aad.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        expected_chunk_aad.extend_from_slice(&0x0506_0708u32.to_be_bytes());
+        assert_eq!(
+            chunk_aad(vault, object, version, 0x0102_0304, 0x0506_0708),
+            expected_chunk_aad
+        );
+
+        let mut expected_manifest_aad = b"VLT1/MANIFEST\0".to_vec();
+        expected_manifest_aad.extend_from_slice(vault.as_bytes());
+        expected_manifest_aad.extend_from_slice(object.as_bytes());
+        expected_manifest_aad.extend_from_slice(version.as_bytes());
+        assert_eq!(manifest_aad(vault, object, version), expected_manifest_aad);
+
+        let mut expected_wrapped_dek_aad = b"VLT1/WRAPPED-DEK\0".to_vec();
+        expected_wrapped_dek_aad.extend_from_slice(vault.as_bytes());
+        expected_wrapped_dek_aad.extend_from_slice(object.as_bytes());
+        expected_wrapped_dek_aad.extend_from_slice(version.as_bytes());
+        assert_eq!(
+            wrapped_dek_aad(vault, object, version),
+            expected_wrapped_dek_aad
+        );
+
+        let digest = chunk_digest(&[(
+            3,
+            SealedRecord {
+                nonce: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                ciphertext: vec![0xa0, 0xa1, 0xa2],
+            },
+        )]);
+        assert_eq!(
+            digest,
+            [
+                0xb7, 0x33, 0x06, 0xeb, 0x50, 0x77, 0x80, 0x48, 0x43, 0x62, 0x23, 0x62, 0x8c, 0x22,
+                0x64, 0x5a, 0xc5, 0x61, 0x0b, 0x52, 0x3a, 0x07, 0x74, 0x80, 0xab, 0x73, 0x2d, 0xfa,
+                0xe9, 0x25, 0xe0, 0x9b,
+            ]
+        );
     }
 
     #[test]

@@ -282,6 +282,39 @@ mod tests {
     }
 
     #[test]
+    fn canonical_manifest_bytes_match_the_fixed_wire_vector() {
+        let manifest = Manifest {
+            format_version: 1,
+            object_id: ObjectId::from_slice(&(0u8..16).collect::<Vec<_>>())
+                .expect("fixed object ID"),
+            version_id: VersionId::from_slice(&(16u8..32).collect::<Vec<_>>())
+                .expect("fixed version ID"),
+            plaintext_len: 0x0102,
+            chunk_size: 4096,
+            chunk_count: 2,
+            chunk_digest: [0xa5; 32],
+        };
+        let expected = [
+            &[0xa8, 0x01, 0x01, 0x02, 0x50][..],
+            &(0u8..16).collect::<Vec<_>>(),
+            &[0x03, 0x50][..],
+            &(16u8..32).collect::<Vec<_>>(),
+            &[
+                0x04, 0x19, 0x01, 0x02, 0x05, 0x19, 0x10, 0x00, 0x06, 0x02, 0x07, 0x58, 0x20,
+            ][..],
+            &[0xa5; 32],
+            &[0x08, 0x01][..],
+        ]
+        .concat();
+
+        assert_eq!(encode_manifest(&manifest), expected);
+        assert_eq!(
+            decode_manifest(&expected).expect("decode fixed vector"),
+            manifest
+        );
+    }
+
+    #[test]
     fn manifest_encoding_is_deterministic_and_round_trips() {
         let manifest = sample_manifest();
         let encoded_once = encode_manifest(&manifest);
