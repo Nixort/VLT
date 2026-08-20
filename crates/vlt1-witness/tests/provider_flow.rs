@@ -6,10 +6,10 @@
 
 use std::{
     fs,
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     process::{Child, Command},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tempfile::tempdir;
@@ -51,16 +51,30 @@ fn start_witness() -> (tempfile::TempDir, Child, String, [u8; 32]) {
         ])
         .spawn()
         .expect("witness daemon");
+    wait_for_witness_listener(address);
     let public_key = ed25519_dalek::SigningKey::from_bytes(&seed)
         .verifying_key()
         .to_bytes();
     (directory, child, format!("http://{address}"), public_key)
 }
 
+fn wait_for_witness_listener(address: std::net::SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(20)) {
+            Ok(stream) => {
+                drop(stream);
+                return;
+            }
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("witness listener did not become ready: {error}"),
+        }
+    }
+}
+
 #[test]
 fn rollover_provider_accepts_only_configured_previous_anchor() {
     let (_directory, mut child, endpoint, previous_public_key) = start_witness();
-    thread::sleep(Duration::from_millis(100));
 
     let primary_public_key = ed25519_dalek::SigningKey::from_bytes(&[43; 32])
         .verifying_key()
@@ -91,7 +105,6 @@ fn rollover_provider_accepts_only_configured_previous_anchor() {
 #[test]
 fn external_witness_issues_idempotent_receipts_and_fresh_heads() {
     let (directory, mut child, endpoint, public_key) = start_witness();
-    thread::sleep(Duration::from_millis(100));
 
     let vault_id = VaultId::random();
     let object_id = ObjectId::random();
