@@ -121,6 +121,73 @@ fn authorised_local_client_executes_a_full_vault_flow() {
 }
 
 #[test]
+fn long_stream_rejects_later_requests_without_waiting_for_vault_mutex() {
+    let directory = tempdir().expect("temporary directory");
+    let vault_path = directory.path().join("vault.sqlite");
+    let socket_path = directory.path().join("vlt1.sock");
+    Vault::create(&vault_path, "correct horse battery staple").expect("vault creation");
+
+    let mut config = DaemonConfig::for_current_user(socket_path.clone(), vault_path);
+    config.allow_shutdown = true;
+    let daemon = Daemon::open(config).expect("daemon open");
+    let server = {
+        let daemon = daemon.clone();
+        thread::spawn(move || daemon.serve().expect("daemon serve"))
+    };
+    wait_for_socket(&socket_path);
+    assert_eq!(
+        call(
+            &socket_path,
+            &Request::Unlock {
+                passphrase: "correct horse battery staple".to_owned(),
+            },
+        ),
+        Success::Empty
+    );
+
+    let mut upload = UnixStream::connect(&socket_path).expect("connect streaming upload");
+    write_frame(
+        &mut upload,
+        &Request::PutStream {
+            object_id: ObjectId::random().to_hex(),
+        },
+    )
+    .expect("start streaming upload");
+    assert!(matches!(
+        read_frame::<Response, _>(&mut upload).expect("upload ready"),
+        Response::Ok {
+            result: Success::StreamReady
+        }
+    ));
+
+    let started = Instant::now();
+    let response = call_response(&socket_path, &Request::Status);
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert!(matches!(
+        response,
+        Response::Error { ref error } if error.code == ErrorCode::Overloaded
+    ));
+
+    drop(upload);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match call_response(&socket_path, &Request::Status) {
+            Response::Ok {
+                result: Success::Status { .. },
+            } => break,
+            Response::Error { ref error }
+                if error.code == ErrorCode::Overloaded && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            response => panic!("unexpected response after stream cleanup: {response:?}"),
+        }
+    }
+    assert_eq!(call(&socket_path, &Request::Shutdown), Success::Empty);
+    server.join().expect("daemon thread join");
+}
+
+#[test]
 fn binary_streaming_round_trip_exceeds_legacy_base64_frame_limit() {
     let directory = tempdir().expect("temporary directory");
     let vault_path = directory.path().join("vault.sqlite");

@@ -105,6 +105,7 @@ struct DaemonState {
     recovery: Mutex<RecoveryState>,
     witness: Option<Mutex<HttpsWitnessProvider>>,
     active_connections: AtomicUsize,
+    long_operation_active: AtomicBool,
     shutdown: AtomicBool,
 }
 
@@ -114,6 +115,10 @@ struct RecoveryState {
 }
 
 struct ConnectionPermit {
+    state: Arc<DaemonState>,
+}
+
+struct LongOperationPermit {
     state: Arc<DaemonState>,
 }
 
@@ -133,6 +138,14 @@ impl Drop for ConnectionPermit {
         self.state
             .active_connections
             .fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl Drop for LongOperationPermit {
+    fn drop(&mut self) {
+        self.state
+            .long_operation_active
+            .store(false, Ordering::Release);
     }
 }
 
@@ -171,6 +184,7 @@ impl Daemon {
                 }),
                 witness,
                 active_connections: AtomicUsize::new(0),
+                long_operation_active: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
             }),
         })
@@ -238,6 +252,16 @@ impl Daemon {
         }
     }
 
+    fn try_acquire_long_operation(&self) -> Option<LongOperationPermit> {
+        self.state
+            .long_operation_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| LongOperationPermit {
+                state: Arc::clone(&self.state),
+            })
+    }
+
     fn try_acquire_connection(&self) -> Option<ConnectionPermit> {
         let active = &self.state.active_connections;
         loop {
@@ -272,6 +296,11 @@ impl Daemon {
     }
 
     fn dispatch(&self, request: Request) -> Response {
+        if self.state.long_operation_active.load(Ordering::Acquire)
+            && !matches!(request, Request::Shutdown)
+        {
+            return overloaded_response("daemon long operation is in progress");
+        }
         match request {
             Request::Status => self.status(),
             Request::Unlock { passphrase } => self.unlock(&passphrase),
@@ -319,6 +348,9 @@ impl Daemon {
     }
 
     fn status(&self) -> Response {
+        if self.state.long_operation_active.load(Ordering::Acquire) {
+            return overloaded_response("daemon long operation is in progress");
+        }
         let (vault_id, lifecycle) = {
             let Ok(vault) = self.state.vault.lock() else {
                 return Response::Error {
@@ -364,6 +396,9 @@ impl Daemon {
     }
 
     fn verify(&self) -> Response {
+        let Some(_permit) = self.try_acquire_long_operation() else {
+            return overloaded_response("daemon long operation is in progress");
+        };
         let result = if self.state.witness.is_some() {
             self.with_witness_result(|vault, witness| {
                 vault.verify_active_objects_with_witness(witness)
@@ -390,6 +425,9 @@ impl Daemon {
     }
 
     fn backup(&self, destination: &Path) -> Response {
+        let Some(_permit) = self.try_acquire_long_operation() else {
+            return overloaded_response("daemon long operation is in progress");
+        };
         self.with_vault(|vault| {
             let manifest = vault.backup_to(destination)?;
             Ok(Success::Backup {
@@ -428,6 +466,12 @@ impl Daemon {
     }
 
     fn put_stream(&self, stream: &mut UnixStream, object_id: &str) -> io::Result<()> {
+        let Some(_permit) = self.try_acquire_long_operation() else {
+            return write_response(
+                stream,
+                &overloaded_response("daemon long operation is in progress"),
+            );
+        };
         let object_id = match parse_object_id(object_id) {
             Ok(object_id) => object_id,
             Err(response) => return write_response(stream, &response),
@@ -468,6 +512,12 @@ impl Daemon {
     }
 
     fn get_stream(&self, stream: &mut UnixStream, object_id: &str) -> io::Result<()> {
+        let Some(_permit) = self.try_acquire_long_operation() else {
+            return write_response(
+                stream,
+                &overloaded_response("daemon long operation is in progress"),
+            );
+        };
         let object_id = match parse_object_id(object_id) {
             Ok(object_id) => object_id,
             Err(response) => return write_response(stream, &response),
@@ -688,11 +738,15 @@ fn write_stream_failure(stream: &mut UnixStream, code: ErrorCode, message: &str)
     )
 }
 
+fn overloaded_response(message: &str) -> Response {
+    Response::Error {
+        error: failure(ErrorCode::Overloaded, message),
+    }
+}
+
 fn reject_overloaded(stream: &mut UnixStream) {
     let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-    let response = Response::Error {
-        error: failure(ErrorCode::Overloaded, "daemon connection limit reached"),
-    };
+    let response = overloaded_response("daemon connection limit reached");
     let _ = write_frame(stream, &response);
 }
 
