@@ -97,7 +97,7 @@ impl KdfParams {
 #[cfg(test)]
 mod tests {
     use super::{
-        chunk_aad, chunk_digest, manifest_aad, open_root_key, seal_root_key, wrapped_dek_aad,
+        chunk_aad, manifest_aad, open_root_key, seal_root_key, wrapped_dek_aad, ChunkDigestBuilder,
         KdfParams, DEFAULT_ARGON2_ITERATIONS, DEFAULT_ARGON2_LANES, DEFAULT_ARGON2_MEMORY_KIB,
         MAX_ARGON2_ITERATIONS, MAX_ARGON2_MEMORY_KIB,
     };
@@ -183,13 +183,13 @@ mod tests {
             expected_wrapped_dek_aad
         );
 
-        let digest = chunk_digest(&[(
-            3,
-            SealedRecord {
-                nonce: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-                ciphertext: vec![0xa0, 0xa1, 0xa2],
-            },
-        )]);
+        let record = SealedRecord {
+            nonce: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            ciphertext: vec![0xa0, 0xa1, 0xa2],
+        };
+        let mut digest_builder = ChunkDigestBuilder::new();
+        digest_builder.update(3, &record);
+        let digest = digest_builder.finalize();
         assert_eq!(
             digest,
             [
@@ -406,16 +406,6 @@ impl ChunkDigestBuilder {
     pub(crate) fn finalize(self) -> [u8; 32] {
         self.hasher.finalize().into()
     }
-}
-
-/// Computes the digest committed by a Manifest over every encrypted chunk.
-#[must_use]
-pub fn chunk_digest(chunks: &[(u32, SealedRecord)]) -> [u8; 32] {
-    let mut digest = ChunkDigestBuilder::new();
-    for (index, record) in chunks {
-        digest.update(*index, record);
-    }
-    digest.finalize()
 }
 
 fn derive_passphrase_key(

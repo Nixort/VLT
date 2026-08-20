@@ -14,9 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     cde::{decode_manifest, encode_manifest},
     crypto::{
-        chunk_aad, chunk_digest, derive_kek, derive_manifest_key, generate_dek, generate_root_key,
-        manifest_aad, open, open_root_key, seal, seal_root_key, wrapped_dek_aad,
-        ChunkDigestBuilder, KdfParams,
+        chunk_aad, derive_kek, derive_manifest_key, generate_dek, generate_root_key, manifest_aad,
+        open, open_root_key, seal, seal_root_key, wrapped_dek_aad, ChunkDigestBuilder, KdfParams,
     },
     error::{Result, VaultError},
     format::{EncryptedChunk, Manifest, ObjectId, VaultId, VersionId, FORMAT_VERSION},
@@ -596,7 +595,7 @@ impl Vault {
         let version_id = VersionId::random();
         let mut data_key = generate_dek();
         let mut chunks = Vec::with_capacity(chunk_count_usize);
-        let mut digest_input = Vec::with_capacity(chunk_count_usize);
+        let mut digest = ChunkDigestBuilder::new();
         for (offset, chunk) in plaintext.chunks(chunk_size).enumerate() {
             let index =
                 u32::try_from(offset).map_err(|_| VaultError::InvalidInput("chunk index"))?;
@@ -610,7 +609,7 @@ impl Vault {
                 chunk_len,
             );
             let record = seal(&data_key[..], &aad, chunk)?;
-            digest_input.push((index, record.clone()));
+            digest.update(index, &record);
             chunks.push(EncryptedChunk { index, record });
         }
         let manifest = Manifest {
@@ -620,7 +619,7 @@ impl Vault {
             plaintext_len,
             chunk_size: chunk_size_u32,
             chunk_count,
-            chunk_digest: chunk_digest(&digest_input),
+            chunk_digest: digest.finalize(),
         };
         let manifest_bytes = encode_manifest(&manifest);
         let mut manifest_key = derive_manifest_key(&data_key, version_id)?;
