@@ -52,6 +52,8 @@ cmp ./secret.txt ./recovered.txt
 ./target/release/vlt1 lock --socket "$SOCKET_DIR/vlt1.sock"
 ```
 
+`vlt1 get` publishes verified plaintext only to a **new direct path** inside real existing directories. It refuses existing files, symlink output paths, and output paths whose lexical parent chain contains a symlink; choose a dedicated owner-controlled recovery directory.
+
 ## Verification
 
 Run the complete release gate before a merge or release. The locked MSRV command is part of the support contract, not an optional compatibility check.

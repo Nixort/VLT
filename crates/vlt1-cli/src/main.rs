@@ -232,10 +232,7 @@ fn put(socket: &Path, object_id: &str, input: &Path) -> Result<()> {
 }
 
 fn get(socket: &Path, object_id: &str, output: &Path) -> Result<()> {
-    let parent = output
-        .parent()
-        .filter(|parent| parent.is_dir())
-        .context("plaintext output parent directory does not exist")?;
+    let parent = validate_new_plaintext_output(output)?;
     let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
         format!(
             "could not create temporary output beside {}",
@@ -338,10 +335,7 @@ fn expect_stream_ready(response: &Success) -> Result<()> {
 
 #[cfg(test)]
 fn write_new_plaintext(output: &Path, plaintext: &[u8]) -> Result<()> {
-    let parent = output
-        .parent()
-        .filter(|parent| parent.is_dir())
-        .context("plaintext output parent directory does not exist")?;
+    let parent = validate_new_plaintext_output(output)?;
     let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
         format!(
             "could not create temporary output beside {}",
@@ -368,10 +362,7 @@ fn write_new_plaintext(output: &Path, plaintext: &[u8]) -> Result<()> {
 }
 
 fn publish_private_temporary_file(temporary: &NamedTempFile, output: &Path) -> Result<()> {
-    let parent = output
-        .parent()
-        .filter(|parent| parent.is_dir())
-        .context("plaintext output parent directory does not exist")?;
+    let parent = validate_new_plaintext_output(output)?;
     fs::hard_link(temporary.path(), output).with_context(|| {
         format!(
             "refusing to overwrite plaintext output: {}",
@@ -387,6 +378,47 @@ fn publish_private_temporary_file(temporary: &NamedTempFile, output: &Path) -> R
             )
         })?;
     Ok(())
+}
+
+fn validate_new_plaintext_output(output: &Path) -> Result<&Path> {
+    let parent = output
+        .parent()
+        .context("plaintext output path has no parent directory")?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    for ancestor in parent
+        .ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        let metadata = fs::symlink_metadata(ancestor).with_context(|| {
+            format!(
+                "plaintext output parent directory does not exist: {}",
+                ancestor.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            bail!(
+                "plaintext output parent must be a direct directory path: {}",
+                ancestor.display()
+            );
+        }
+    }
+    match fs::symlink_metadata(output) {
+        Ok(_) => bail!(
+            "refusing to overwrite plaintext output: {}",
+            output.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(parent),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "could not inspect plaintext output path: {}",
+                output.display()
+            )
+        }),
+    }
 }
 
 fn rotate_passphrase(socket: &Path) -> Result<()> {
@@ -478,7 +510,10 @@ impl ErrorCodeText for vlt1_protocol::Failure {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::{symlink, PermissionsExt},
+    };
 
     use tempfile::tempdir;
 
@@ -503,6 +538,26 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn plaintext_output_refuses_symlink_paths_and_symlinked_parent_directories() {
+        let directory = tempdir().expect("temporary directory");
+        let target = directory.path().join("target.txt");
+        fs::write(&target, b"existing plaintext").expect("write target");
+        let output_link = directory.path().join("output-link.txt");
+        symlink(&target, &output_link).expect("output symlink");
+        assert!(write_new_plaintext(&output_link, b"replacement").is_err());
+        assert_eq!(
+            fs::read(&target).expect("read target"),
+            b"existing plaintext"
+        );
+
+        let parent_link = directory.path().join("output-parent-link");
+        symlink(directory.path(), &parent_link).expect("parent symlink");
+        let unsafe_output = parent_link.join("recovered.txt");
+        assert!(write_new_plaintext(&unsafe_output, b"verified plaintext").is_err());
+        assert!(!directory.path().join("recovered.txt").exists());
     }
 
     #[test]
