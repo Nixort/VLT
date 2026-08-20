@@ -10,7 +10,10 @@
 //! material to return the same receipt after an uncertain client retry.
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use ed25519_dalek::SigningKey;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -106,6 +109,7 @@ impl WitnessService {
     /// Returns an error when the database cannot be opened or initialized.
     pub fn open(path: impl AsRef<Path>, signing_key: SigningKey) -> Result<Self, VaultError> {
         let path = path.as_ref();
+        validate_state_path(path)?;
         let connection = Connection::open(path).map_err(|_| VaultError::Storage)?;
         let journal_mode: String = connection
             .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
@@ -377,6 +381,34 @@ fn parse_id<const N: usize>(value: &str, error: &'static str) -> Result<[u8; N],
     fixed::<N>(&bytes)
 }
 
+fn validate_state_path(path: &Path) -> Result<(), VaultError> {
+    const INPUT: &str = "witness state path";
+    let parent = path.parent().ok_or(VaultError::InvalidInput(INPUT))?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    for ancestor in parent
+        .ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        let metadata =
+            fs::symlink_metadata(ancestor).map_err(|_| VaultError::InvalidInput(INPUT))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(VaultError::InvalidInput(INPUT));
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Ok(())
+        }
+        Ok(_) => Err(VaultError::InvalidInput(INPUT)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(VaultError::Storage),
+    }
+}
+
 fn fixed<const N: usize>(value: &[u8]) -> Result<[u8; N], VaultError> {
     value
         .try_into()
@@ -385,6 +417,8 @@ fn fixed<const N: usize>(value: &[u8]) -> Result<[u8; N], VaultError> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use vlt1_core::{ObjectId, VaultError, VaultId, VersionId};
@@ -403,6 +437,23 @@ mod tests {
             commitment: "11".repeat(32),
             expected_epoch: 0,
         }
+    }
+
+    #[test]
+    fn witness_state_rejects_symlink_paths_and_symlinked_parent_directories() {
+        let directory = tempdir().expect("directory");
+        let target = directory.path().join("target.sqlite");
+        let state_link = directory.path().join("state-link.sqlite");
+        symlink(&target, &state_link).expect("state symlink");
+        assert!(WitnessService::open(&state_link, SigningKey::from_bytes(&[7; 32])).is_err());
+
+        let parent_link = directory.path().join("state-parent-link");
+        symlink(directory.path(), &parent_link).expect("parent symlink");
+        assert!(WitnessService::open(
+            parent_link.join("witness.sqlite"),
+            SigningKey::from_bytes(&[7; 32]),
+        )
+        .is_err());
     }
 
     #[test]
