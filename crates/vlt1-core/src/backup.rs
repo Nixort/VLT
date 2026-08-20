@@ -20,7 +20,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::{error::Result, format::VaultId, VaultError};
+use crate::{
+    error::Result,
+    format::VaultId,
+    path_safety::{validate_existing_regular_file, validate_new_regular_file},
+    VaultError,
+};
 
 const BACKUP_FORMAT: &str = "VLT/1 encrypted SQLite backup v1";
 
@@ -69,6 +74,8 @@ impl BackupManifest {
     /// Returns an error when JSON is malformed or required fields do not obey
     /// VLT/1 fixed-width format constraints.
     pub fn read_from(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        validate_existing_regular_file(path, "backup manifest path")?;
         let bytes = fs::read(path).map_err(|_| VaultError::Storage)?;
         let manifest: Self = serde_json::from_slice(&bytes)
             .map_err(|_| VaultError::invalid_format("backup manifest JSON"))?;
@@ -85,6 +92,7 @@ impl BackupManifest {
     pub fn verify_backup(&self, backup_path: impl AsRef<Path>) -> Result<()> {
         self.validate()?;
         let backup_path = backup_path.as_ref();
+        validate_existing_regular_file(backup_path, "backup source path")?;
         let (sha256, bytes) = checksum_file(backup_path)?;
         if bytes != self.database_bytes || sha256 != self.database_sha256 {
             return Err(VaultError::Authentication);
@@ -249,19 +257,13 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn ensure_new_destination(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Err(VaultError::InvalidInput("backup destination path"));
-    };
-    if path.exists() || !parent.is_dir() {
-        return Err(VaultError::InvalidInput("backup destination path"));
-    }
-    Ok(())
+    validate_new_regular_file(path, "backup destination path")
 }
 
 fn create_temporary_file(destination: &Path) -> Result<NamedTempFile> {
+    validate_new_regular_file(destination, "backup destination path")?;
     let parent = destination
         .parent()
-        .filter(|parent| parent.is_dir())
         .ok_or(VaultError::InvalidInput("backup destination path"))?;
     NamedTempFile::new_in(parent).map_err(|_| VaultError::Storage)
 }

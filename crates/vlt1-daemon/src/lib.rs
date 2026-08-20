@@ -751,20 +751,45 @@ fn reject_overloaded(stream: &mut UnixStream) {
 }
 
 fn bind_socket(path: &Path) -> io::Result<UnixListener> {
-    if path.exists() {
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_socket() {
-            fs::remove_file(path)?;
-        } else {
+    validate_socket_parent(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
+        Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "refusing to replace a non-socket path",
-            ));
+            ))
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     let listener = UnixListener::bind(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+fn validate_socket_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path has no parent directory",
+        )
+    })?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    for ancestor in parent.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket parent must be a direct directory path",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn ignore_not_found(error: io::Error) -> io::Result<()> {

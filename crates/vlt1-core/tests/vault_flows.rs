@@ -4,7 +4,10 @@
 
 //! Regression tests for VLT/1 lifecycle and tamper-detection invariants.
 
-use std::{io::Read, os::unix::fs::PermissionsExt};
+use std::{
+    io::Read,
+    os::unix::fs::{symlink, PermissionsExt},
+};
 
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -351,4 +354,28 @@ fn online_backup_restores_verified_encrypted_vault_and_rejects_tampering() {
     let rejected_restore = directory.path().join("rejected.sqlite");
     assert!(Vault::restore_from_backup(&tampered_backup, &manifest, &rejected_restore).is_err());
     assert!(!rejected_restore.exists());
+}
+
+#[test]
+fn vault_and_backup_paths_reject_symlinks_and_unsafe_parent_directories() {
+    let (directory, vault_path, vault) = create_vault();
+    let vault_link = directory.path().join("vault-link.sqlite");
+    symlink(&vault_path, &vault_link).expect("vault symlink");
+    assert!(Vault::open(&vault_link).is_err());
+
+    let backup = directory.path().join("backup.sqlite");
+    let manifest = vault.backup_to(&backup).expect("online backup");
+    let backup_link = directory.path().join("backup-link.sqlite");
+    symlink(&backup, &backup_link).expect("backup symlink");
+    assert!(manifest.verify_backup(&backup_link).is_err());
+
+    let output_link = directory.path().join("output-link.sqlite");
+    symlink(&backup, &output_link).expect("output symlink");
+    assert!(vault.backup_to(&output_link).is_err());
+
+    let unsafe_parent = directory.path().join("unsafe-parent");
+    symlink(directory.path(), &unsafe_parent).expect("parent symlink");
+    let unsafe_destination = unsafe_parent.join("new-backup.sqlite");
+    assert!(vault.backup_to(&unsafe_destination).is_err());
+    assert!(!unsafe_destination.exists());
 }

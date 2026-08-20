@@ -5,7 +5,7 @@
 //! End-to-end local Unix-socket protocol tests for `vlt1d`.
 
 use std::{
-    os::unix::net::UnixStream,
+    os::unix::{fs::symlink, net::UnixStream},
     sync::{Arc, Barrier},
     thread,
     time::{Duration, Instant},
@@ -185,6 +185,19 @@ fn long_stream_rejects_later_requests_without_waiting_for_vault_mutex() {
     }
     assert_eq!(call(&socket_path, &Request::Shutdown), Success::Empty);
     server.join().expect("daemon thread join");
+}
+
+#[test]
+fn daemon_refuses_socket_path_with_symlinked_parent() {
+    let directory = tempdir().expect("temporary directory");
+    let vault_path = directory.path().join("vault.sqlite");
+    Vault::create(&vault_path, "correct horse battery staple").expect("vault creation");
+    let socket_parent = directory.path().join("socket-parent");
+    symlink(directory.path(), &socket_parent).expect("socket parent symlink");
+
+    let config = DaemonConfig::for_current_user(socket_parent.join("vlt1.sock"), vault_path);
+    let daemon = Daemon::open(config).expect("daemon open");
+    assert!(daemon.serve().is_err());
 }
 
 #[test]

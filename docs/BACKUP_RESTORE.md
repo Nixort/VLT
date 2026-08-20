@@ -45,6 +45,8 @@ An operator must test the restore on a separate path, unlock it with the correct
 | Keep backup storage and the witness state under independent operational control. | Co-restoring both systems defeats rollback evidence. |
 | Retain the backup database and sidecar together. | The restore command verifies their binding before creating an output. |
 | Never overwrite a running daemon-owned vault database. | VLT/1 deliberately requires a stopped daemon and a new destination to avoid accidental live replacement. |
+| Use direct regular-file paths for vault databases, backup sources, manifests, and new backup/restore outputs. | VLT/1 rejects symlink files and non-regular filesystem objects at these security boundaries, preventing accidental path indirection. |
+| Place vault, backup, restore, and daemon socket paths below real existing directories with no symlink component. | VLT/1 rejects symlinked or non-directory path parents before opening, creating, unlinking, or binding a sensitive artifact. |
 | Use encryption at rest for backup media. | The VLT/1 snapshot remains application-encrypted, but metadata, access patterns, and passphrase envelope remain sensitive operational assets. |
 | Rehearse restores after every deployment or storage-policy change. | A successful snapshot does not prove permissions, passphrase availability, witness access, or operator steps. |
 

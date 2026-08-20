@@ -20,6 +20,7 @@ mod cde;
 mod crypto;
 mod error;
 mod format;
+mod path_safety;
 mod private_file;
 mod storage;
 mod vault;

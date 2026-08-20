@@ -16,6 +16,7 @@ use crate::{
     crypto::{KdfParams, RootEnvelope},
     error::{Result, VaultError},
     format::{EncryptedChunk, ObjectId, SealedRecord, VersionId, FORMAT_VERSION},
+    path_safety::{validate_existing_regular_file, validate_new_regular_file},
     private_file::enforce_owner_private_sqlite_state,
     witness::WitnessReceipt,
 };
@@ -69,6 +70,7 @@ pub(crate) struct StreamingPublication<'connection> {
 impl Storage {
     /// Creates and initializes a new `SQLite` database at `path`.
     pub(crate) fn create(path: &Path, envelope: &RootEnvelope) -> Result<Self> {
+        validate_new_regular_file(path, "vault database path")?;
         let storage = Self::open_connection(path)?;
         storage.initialize_schema()?;
         storage.insert_envelope(envelope)?;
@@ -78,6 +80,7 @@ impl Storage {
 
     /// Opens an existing VLT/1 database.
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        validate_existing_regular_file(path, "vault database path")?;
         let storage = Self::open_connection(path)?;
         storage.initialize_schema()?;
         storage.enforce_owner_private_state_files()?;
