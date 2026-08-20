@@ -76,6 +76,7 @@ Parser fuzzing and benchmark reproduction are deliberately separate workflows; u
 | Backup and no-overwrite restore procedure | [`docs/BACKUP_RESTORE.md`](docs/BACKUP_RESTORE.md) |
 | Benchmark methodology, recorded result, and reproduction | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) |
 | Witness trust bootstrap and wire contract | [`docs/WITNESS_PROTOCOL.md`](docs/WITNESS_PROTOCOL.md) |
+| Release assets, checksums, SBOM, and provenance verification | [`docs/RELEASE.md`](docs/RELEASE.md) |
 | Hardened systemd deployment and strict witness operation | [`deploy/README.md`](deploy/README.md) |
 | Fuzz targets, corpus handling, and crash workflow | [`fuzz/README.md`](fuzz/README.md) |
 | Private security reporting | [`SECURITY.md`](SECURITY.md) |
