@@ -31,9 +31,12 @@ struct Arguments {
     /// Root-owned file containing the witness bearer credential.
     #[arg(long)]
     witness_token_file: Option<PathBuf>,
-    /// Root-owned file containing a lowercase hexadecimal Ed25519 public key.
+    /// Root-owned file containing the primary lowercase hexadecimal Ed25519 public key.
     #[arg(long)]
     witness_public_key_file: Option<PathBuf>,
+    /// Optional root-owned file containing the previous key during a planned rollover.
+    #[arg(long)]
+    witness_previous_public_key_file: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -47,6 +50,7 @@ fn main() -> Result<()> {
         arguments.witness_endpoint,
         arguments.witness_token_file,
         arguments.witness_public_key_file,
+        arguments.witness_previous_public_key_file,
     )?;
     let daemon = Daemon::open(config).context("could not open VLT/1 daemon vault")?;
     daemon.serve().context("VLT/1 daemon stopped with an error")
@@ -56,20 +60,34 @@ fn witness_config(
     endpoint: Option<String>,
     token_file: Option<PathBuf>,
     public_key_file: Option<PathBuf>,
+    previous_public_key_file: Option<PathBuf>,
 ) -> Result<Option<WitnessConfig>> {
-    match (endpoint, token_file, public_key_file) {
-        (None, None, None) => Ok(None),
-        (Some(endpoint), Some(token_file), Some(public_key_file)) => {
+    match (
+        endpoint,
+        token_file,
+        public_key_file,
+        previous_public_key_file,
+    ) {
+        (None, None, None, None) => Ok(None),
+        (Some(endpoint), Some(token_file), Some(public_key_file), previous_public_key_file) => {
             let token = read_secret(&token_file)?;
-            let public_key_text = read_secret(&public_key_file)?;
-            let public_key = parse_hex32(public_key_text.trim())?;
+            let public_key = parse_hex32(read_secret(&public_key_file)?.trim())?;
+            let previous_public_key = previous_public_key_file
+                .map(|path| read_secret(&path).and_then(|value| parse_hex32(value.trim())))
+                .transpose()?;
+            if previous_public_key == Some(public_key) {
+                bail!("witness previous public key must differ from the primary public key");
+            }
             Ok(Some(WitnessConfig {
                 endpoint,
                 bearer_token: token,
                 public_key,
+                previous_public_key,
             }))
         }
-        _ => bail!("witness endpoint, token file and public key file must be supplied together"),
+        _ => bail!(
+            "witness endpoint, token file and primary public key file must be supplied together"
+        ),
     }
 }
 

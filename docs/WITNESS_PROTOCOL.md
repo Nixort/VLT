@@ -7,7 +7,9 @@ This protocol turns the VLT/1 `WitnessProvider` extension point into an interope
 
 ## Trust bootstrap
 
-The VLT/1 daemon must be configured with three independently provisioned values: a canonical HTTPS endpoint, a 32-byte Ed25519 **pinned witness public key**, and a high-entropy bearer credential stored in a root-owned/daemon-readable file. TLS authenticates the endpoint and protects the bearer credential in transit; the pinned Ed25519 key authenticates protocol objects independently of the Web PKI.
+The VLT/1 daemon must be configured with three independently provisioned values: a canonical HTTPS endpoint, a 32-byte Ed25519 **primary pinned witness public key**, and a high-entropy bearer credential stored in a root-owned/daemon-readable file. TLS authenticates the endpoint and protects the bearer credential in transit; the pinned Ed25519 key authenticates protocol objects independently of the Web PKI.
+
+A planned signer rotation may configure exactly one additional **previous public key**. The client accepts signatures under either configured key during this bounded overlap and rejects every other key. The witness operator first deploys the new signer, then clients deploy the new primary key with the old key as `--witness-previous-public-key-file`, and finally remove the previous-key option only after every vault has verified a new-key head. The previous key is not an automatic or permanent trust expansion; a primary/previous duplicate is rejected at startup.
 
 The bearer credential authorizes requests but is not a freshness signing key. Compromise of a client credential can at most create availability disruption by advancing the remote head; it cannot forge an acceptable receipt without the independently retained Ed25519 signing key. A production deployment should use a reverse proxy with mutual TLS or an equivalent stronger client-authentication mechanism instead of bearer credentials where feasible.
 
@@ -41,7 +43,7 @@ Object-head signatures use a distinct unambiguous sequence:
 version_id_or_zero || object_epoch_be_u64 || commitment_or_zero || challenge
 ```
 
-The Ed25519 verifier rejects malformed public keys, invalid signatures, non-lowercase encodings, incorrect fixed widths, incorrect bindings, and signatures under a key other than the pinned public key. Ed25519 signing and verification use the RFC 8032 construction; VLT/1 supplies its own protocol-level domain separation because plain Ed25519 itself has an empty context.[1]
+The Ed25519 verifier rejects malformed public keys, invalid signatures, non-lowercase encodings, incorrect fixed widths, incorrect bindings, and signatures under a key other than the primary or explicitly configured previous public key. Ed25519 signing and verification use the RFC 8032 construction; VLT/1 supplies its own protocol-level domain separation because plain Ed25519 itself has an empty context.[1]
 
 ## Independent durable state
 

@@ -58,6 +58,37 @@ fn start_witness() -> (tempfile::TempDir, Child, String, [u8; 32]) {
 }
 
 #[test]
+fn rollover_provider_accepts_only_configured_previous_anchor() {
+    let (_directory, mut child, endpoint, previous_public_key) = start_witness();
+    thread::sleep(Duration::from_millis(100));
+
+    let primary_public_key = ed25519_dalek::SigningKey::from_bytes(&[43; 32])
+        .verifying_key()
+        .to_bytes();
+    let vault_id = VaultId::random();
+    let object_id = ObjectId::random();
+    let request = WitnessRequest::from_parts(vault_id, object_id, VersionId::random(), [7; 32]);
+    let mut rollover = HttpsWitnessProvider::for_loopback_test_with_previous(
+        &endpoint,
+        "integration-token",
+        primary_public_key,
+        Some(previous_public_key),
+    )
+    .expect("bounded rollover provider");
+    rollover
+        .issue_receipt(&request, 0)
+        .expect("configured previous anchor");
+
+    let mut strict =
+        HttpsWitnessProvider::for_loopback_test(&endpoint, "integration-token", primary_public_key)
+            .expect("strict provider");
+    assert!(strict.issue_receipt(&request, 0).is_err());
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn external_witness_issues_idempotent_receipts_and_fresh_heads() {
     let (directory, mut child, endpoint, public_key) = start_witness();
     thread::sleep(Duration::from_millis(100));

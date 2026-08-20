@@ -62,14 +62,19 @@ pub struct DaemonConfig {
 }
 
 /// Pinned authentication material for one external VLT/1 freshness witness.
+///
+/// The optional previous key is a temporary, operator-controlled rollover
+/// overlap. It must be removed after every vault observes the primary key.
 #[derive(Clone, Debug)]
 pub struct WitnessConfig {
     /// Canonical HTTPS witness endpoint without a trailing path.
     pub endpoint: String,
     /// High-entropy request authorization credential.
     pub bearer_token: String,
-    /// Independently provisioned Ed25519 verification key pinned by the daemon.
+    /// Independently provisioned primary Ed25519 verification key.
     pub public_key: [u8; 32],
+    /// One optional previous Ed25519 key accepted only during planned rollover.
+    pub previous_public_key: Option<[u8; 32]>,
 }
 
 impl DaemonConfig {
@@ -147,7 +152,12 @@ impl Daemon {
             .witness
             .as_ref()
             .map(|policy| {
-                HttpsWitnessProvider::new(&policy.endpoint, &policy.bearer_token, policy.public_key)
+                HttpsWitnessProvider::new_with_previous(
+                    &policy.endpoint,
+                    &policy.bearer_token,
+                    policy.public_key,
+                    policy.previous_public_key,
+                )
             })
             .transpose()?
             .map(Mutex::new);

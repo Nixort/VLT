@@ -466,13 +466,15 @@ pub trait WitnessProvider {
 
 /// A pinned HTTPS implementation of [`WitnessProvider`].
 ///
-/// The supplied endpoint must use HTTPS. The witness public key is pinned and
-/// checked for every receipt and head independently of the TLS certificate.
+/// The supplied endpoint must use HTTPS. A primary witness public key is pinned
+/// for every receipt and head independently of TLS. During an explicit key
+/// rollover, one optional previous key can be trusted as a bounded overlap.
 pub struct HttpsWitnessProvider {
     issue_url: String,
     head_url: String,
     authorization: String,
-    pinned_public_key: [u8; 32],
+    primary_public_key: [u8; 32],
+    previous_public_key: Option<[u8; 32]>,
     agent: Agent,
 }
 
@@ -484,7 +486,31 @@ impl HttpsWitnessProvider {
     /// Returns an invalid-input error for a non-HTTPS endpoint or an empty
     /// bearer credential.
     pub fn new(endpoint: &str, bearer_token: &str, pinned_public_key: [u8; 32]) -> Result<Self> {
-        Self::build(endpoint, bearer_token, pinned_public_key, false)
+        Self::new_with_previous(endpoint, bearer_token, pinned_public_key, None)
+    }
+
+    /// Creates a provider with one bounded previous trust anchor during rollover.
+    ///
+    /// The previous key remains trusted only until an operator removes it from
+    /// configuration after every vault has observed the primary key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for an invalid endpoint, empty bearer
+    /// credential, or a previous key equal to the primary key.
+    pub fn new_with_previous(
+        endpoint: &str,
+        bearer_token: &str,
+        primary_public_key: [u8; 32],
+        previous_public_key: Option<[u8; 32]>,
+    ) -> Result<Self> {
+        Self::build(
+            endpoint,
+            bearer_token,
+            primary_public_key,
+            previous_public_key,
+            false,
+        )
     }
 
     /// Creates an HTTP loopback provider for deterministic integration tests.
@@ -497,19 +523,43 @@ impl HttpsWitnessProvider {
         bearer_token: &str,
         pinned_public_key: [u8; 32],
     ) -> Result<Self> {
+        Self::for_loopback_test_with_previous(endpoint, bearer_token, pinned_public_key, None)
+    }
+
+    /// Creates a loopback test provider with an optional previous trust anchor.
+    ///
+    /// This constructor is not a production transport and exists only for
+    /// deterministic rollover integration tests.
+    #[doc(hidden)]
+    pub fn for_loopback_test_with_previous(
+        endpoint: &str,
+        bearer_token: &str,
+        primary_public_key: [u8; 32],
+        previous_public_key: Option<[u8; 32]>,
+    ) -> Result<Self> {
         if !(endpoint.starts_with("http://127.0.0.1") || endpoint.starts_with("http://[::1]")) {
             return Err(VaultError::InvalidInput("loopback witness endpoint"));
         }
-        Self::build(endpoint, bearer_token, pinned_public_key, true)
+        Self::build(
+            endpoint,
+            bearer_token,
+            primary_public_key,
+            previous_public_key,
+            true,
+        )
     }
 
     fn build(
         endpoint: &str,
         bearer_token: &str,
-        pinned_public_key: [u8; 32],
+        primary_public_key: [u8; 32],
+        previous_public_key: Option<[u8; 32]>,
         allow_http: bool,
     ) -> Result<Self> {
-        if (!allow_http && !endpoint.starts_with("https://")) || bearer_token.is_empty() {
+        if (!allow_http && !endpoint.starts_with("https://"))
+            || bearer_token.is_empty()
+            || previous_public_key == Some(primary_public_key)
+        {
             return Err(VaultError::InvalidInput("witness endpoint configuration"));
         }
         let endpoint = endpoint.trim_end_matches('/');
@@ -525,7 +575,8 @@ impl HttpsWitnessProvider {
             issue_url: format!("{endpoint}/v1/issue"),
             head_url: format!("{endpoint}/v1/head"),
             authorization: format!("Bearer {bearer_token}"),
-            pinned_public_key,
+            primary_public_key,
+            previous_public_key,
             agent,
         })
     }
@@ -558,8 +609,10 @@ impl HttpsWitnessProvider {
         }
     }
 
-    fn check_pinned_key(&self, public_key: &[u8; 32]) -> Result<()> {
-        if public_key != &self.pinned_public_key {
+    fn check_trusted_key(&self, public_key: &[u8; 32]) -> Result<()> {
+        if public_key != &self.primary_public_key
+            && self.previous_public_key.as_ref() != Some(public_key)
+        {
             return Err(VaultError::WitnessConflict);
         }
         Ok(())
@@ -574,7 +627,7 @@ impl WitnessProvider for HttpsWitnessProvider {
     ) -> Result<WitnessReceipt> {
         let response = self.post_issue(&IssueWireRequest::from_request(request, expected_epoch))?;
         let receipt = response.into_receipt()?;
-        self.check_pinned_key(receipt.public_key())?;
+        self.check_trusted_key(receipt.public_key())?;
         receipt.verify_request(request)?;
         if receipt.witness_epoch() <= expected_epoch {
             return Err(VaultError::WitnessConflict);
@@ -594,7 +647,7 @@ impl WitnessProvider for HttpsWitnessProvider {
             challenge: hex_encode(&challenge),
         })?;
         let head = response.into_head()?;
-        self.check_pinned_key(head.public_key())?;
+        self.check_trusted_key(head.public_key())?;
         if head.vault_id() != vault_id
             || head.object_id() != object_id
             || head.challenge() != &challenge
