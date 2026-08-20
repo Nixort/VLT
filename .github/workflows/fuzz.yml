@@ -1,0 +1,57 @@
+# Copyright Nixort & Itan Winter <https://github.com/Nixort> 2026.
+#
+# License: GNU General Public License v3.0 or later.
+
+name: VLT/1 fuzz regression
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 6"
+  push:
+    paths:
+      - "fuzz/**"
+      - "crates/vlt1-core/src/cde.rs"
+      - "crates/vlt1-core/src/lib.rs"
+      - "crates/vlt1-protocol/**"
+      - ".github/workflows/fuzz.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vlt1-fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: ASan ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [manifest_decode, ipc_decode]
+    steps:
+      # actions/checkout v4.1.7, pinned by immutable commit SHA.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # dtolnay/rust-toolchain master, pinned by immutable commit SHA.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly-2026-06-01
+      - name: Install pinned cargo-fuzz
+        run: cargo +stable install cargo-fuzz --version 0.12.0 --locked
+      - name: Run bounded AddressSanitizer campaign
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          cargo +nightly-2026-06-01 fuzz run "${{ matrix.target }}" -- \
+            -max_total_time=60 -print_final_stats=1 2>&1 | tee "${{ matrix.target }}.stats.log"
+      # actions/upload-artifact v4, pinned by immutable commit SHA.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: fuzz-${{ matrix.target }}-stats
+          path: fuzz/${{ matrix.target }}.stats.log
+          if-no-files-found: error
+          retention-days: 14

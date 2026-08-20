@@ -40,6 +40,16 @@ cargo +nightly fuzz cmin ipc_decode
 
 When a crash is found, preserve the generated `fuzz/artifacts/<target>/crash-*` input, reproduce it with `cargo +nightly fuzz run <target> <artifact>`, then add a deterministic regression test before accepting the corpus entry. Do not commit artefacts containing user data.
 
+## Bounded CI regression
+
+The `VLT/1 fuzz regression` workflow runs both existing targets for 60 seconds
+with AddressSanitizer on pinned `nightly-2026-06-01`. It is manually dispatchable,
+runs weekly, and also runs when a fuzz target or its parser boundary changes.
+Each target has an independent 10-minute job limit and saves its final libFuzzer
+statistics for 14 days. This bounded campaign detects crashes, sanitizer
+findings, and hangs; it is deliberately not a replacement for longer manual
+coverage campaigns or corpus minimization.
+
 ## Recorded baseline
 
 On **2026-08-17**, VLT/1 ran final 60-second AddressSanitizer-backed campaigns for each target after the critical-hardening implementation. The IPC target completed 2,925,218 executions with 1,194 coverage edges and 3,434 features. The post-campaign minimized corpus retains 55 `manifest_decode` inputs (224 KiB) and 869 `ipc_decode` inputs (3.5 MiB). The campaigns produced **zero crash artifacts**. This is a bounded regression signal, not a proof that either parser is free of defects.
