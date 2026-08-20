@@ -90,8 +90,12 @@ jobs:
           install -m 0755 target/release/vlt1-witnessd "dist/$bundle/vlt1-witnessd"
           install -m 0755 target/release/vlt1-witness-key "dist/$bundle/vlt1-witness-key"
           install -m 0755 target/release/vlt1-bench "dist/$bundle/vlt1-bench"
-          cat > "dist/RELEASE_NOTES.md" <<EOF
-          # VLT/1 ${TAG}
+          notes="docs/releases/${TAG}.md"
+          test -f "$notes"
+          cp "$notes" "dist/RELEASE_NOTES.md"
+          cat >> "dist/RELEASE_NOTES.md" <<EOF
+
+          ## Release bundle and verification
 
           This release contains Linux x86_64 binaries built from commit ${GITHUB_SHA}
           with the locked dependency graph. Verify the download before use:

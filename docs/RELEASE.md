@@ -47,11 +47,14 @@ gh attestation verify VLT-vX.Y.Z-linux-x86_64.tar.gz \
 ## Maintainer release procedure
 
 A maintainer releases only after `main` CI is green and the workspace version
-has been deliberately selected:
+has been deliberately selected. Before tagging, add and review
+`docs/releases/vX.Y.Z.md`; the workflow requires this versioned source changelog
+and uses it as the GitHub release body before appending bundle-verification data.
 
 ```sh
 git checkout main
 git pull --ff-only origin main
+test -f docs/releases/vX.Y.Z.md
 git tag -a vX.Y.Z -m "VLT/1 vX.Y.Z"
 git push origin vX.Y.Z
 ```
