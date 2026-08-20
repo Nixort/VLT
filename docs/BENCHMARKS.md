@@ -44,16 +44,6 @@ The small-payload RPC latency is dominated by process-local socket setup, JSON/b
 
 ![Measured direct core API versus local Unix-socket RPC medians](../results/direct_rpc_benchmark_20260817.png)
 
-## Legacy `put` peak-memory measurement
-
-The direct `put` path has an allocation-sensitive regression harness for observing its complete peak resident set on one Linux host. It builds the locked release benchmark, runs a single deterministic direct publication, stores timing CSV and `peak_rss_kib` output under `results/`, and makes no cross-machine performance claim.
-
-```bash
-scripts/benchmark_put_peak_rss.sh 65536
-```
-
-Use the same Rust toolchain, allocator, host, and payload size for before/after comparison. The value includes the caller plaintext buffer, SQLite, crypto dependencies, and operating-system accounting; it is a reproducible envelope measurement rather than an isolated allocator counter. The legacy `put` implementation retains one encrypted record per output chunk and computes its Manifest digest incrementally, so it no longer duplicates all encrypted records solely for digest input.
-
 ## Reproduce
 
 Run the production-profile benchmark and retain the emitted raw CSV unchanged:
@@ -63,13 +53,9 @@ cd /path/to/vlt1
 cargo run --release -p vlt1 --bin vlt1-bench -- \
   --mode both --payloads-kib 4,64,1024,4096 --runs 5 \
   > results/direct_rpc_benchmark.csv
-
-python3 scripts/plot_benchmarks.py results/direct_rpc_benchmark.csv \
-  --output results/direct_rpc_benchmark.png \
-  --summary results/direct_rpc_benchmark_summary.csv
 ```
 
-Record host, toolchain, command, payloads, and visual-review status with the release result. The plotting script accepts only the exact six-column raw schema emitted by `vlt1-bench`, calculates medians from observed rows, and does not synthesize, smooth, interpolate, or replace samples.
+Record host, toolchain, command, payloads, and visual-review status with the release result. The raw CSV is the authoritative six-column output emitted by `vlt1-bench`; retain it unchanged so any later analysis remains traceable to observed samples.
 
 ## Interpretation and limits
 
