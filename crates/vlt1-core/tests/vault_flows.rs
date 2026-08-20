@@ -4,7 +4,7 @@
 
 //! Regression tests for VLT/1 lifecycle and tamper-detection invariants.
 
-use std::io::Read;
+use std::{io::Read, os::unix::fs::PermissionsExt};
 
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -46,6 +46,26 @@ impl Read for FragmentedReader {
         self.offset += read;
         Ok(read)
     }
+}
+
+#[test]
+fn vault_database_is_owner_private_after_create_and_open() {
+    let (_directory, path, vault) = create_vault();
+    let mode = std::fs::metadata(&path)
+        .expect("created vault metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    drop(vault);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("permissive vault fixture mode");
+    let _reopened = Vault::open(&path).expect("reopen repairs vault mode");
+    let repaired_mode = std::fs::metadata(&path)
+        .expect("repaired vault metadata")
+        .permissions()
+        .mode();
+    assert_eq!(repaired_mode & 0o777, 0o600);
 }
 
 #[test]

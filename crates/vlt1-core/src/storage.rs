@@ -4,7 +4,7 @@
 
 //! `SQLite` persistence for the VLT/1 immutable-version model.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "fault-injection")]
 use std::cell::Cell;
@@ -16,6 +16,7 @@ use crate::{
     crypto::{KdfParams, RootEnvelope},
     error::{Result, VaultError},
     format::{EncryptedChunk, ObjectId, SealedRecord, VersionId, FORMAT_VERSION},
+    private_file::enforce_owner_private_sqlite_state,
     witness::WitnessReceipt,
 };
 
@@ -52,11 +53,13 @@ pub(crate) fn inject_next_witness_finalization_failure() {
 /// `SQLite` backend owning a single local connection.
 pub(crate) struct Storage {
     connection: Connection,
+    path: PathBuf,
 }
 
 /// An uncommitted immutable version receiving encrypted chunks incrementally.
 pub(crate) struct StreamingPublication<'connection> {
     transaction: Transaction<'connection>,
+    state_path: &'connection Path,
     object_id: ObjectId,
     version_id: VersionId,
     next_chunk_index: u32,
@@ -69,6 +72,7 @@ impl Storage {
         let storage = Self::open_connection(path)?;
         storage.initialize_schema()?;
         storage.insert_envelope(envelope)?;
+        storage.enforce_owner_private_state_files()?;
         Ok(storage)
     }
 
@@ -76,6 +80,7 @@ impl Storage {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let storage = Self::open_connection(path)?;
         storage.initialize_schema()?;
+        storage.enforce_owner_private_state_files()?;
         Ok(storage)
     }
 
@@ -147,7 +152,7 @@ impl Storage {
         if changed != 1 {
             return Err(VaultError::Invariant("Root Key envelope replacement"));
         }
-        Ok(())
+        self.enforce_owner_private_state_files()
     }
 
     /// Creates a consistent encrypted `SQLite` online backup snapshot.
@@ -201,6 +206,7 @@ impl Storage {
         )?;
         Ok(StreamingPublication {
             transaction,
+            state_path: &self.path,
             object_id,
             version_id,
             next_chunk_index: 0,
@@ -239,7 +245,7 @@ impl Storage {
             )
             .map_err(|_| VaultError::Storage)?;
         transaction.commit().map_err(|_| VaultError::Storage)?;
-        Ok(())
+        self.enforce_owner_private_state_files()
     }
 
     /// Returns staged versions and their required predecessor witness epoch.
@@ -313,7 +319,7 @@ impl Storage {
             )
             .map_err(|_| VaultError::Storage)?;
         transaction.commit().map_err(|_| VaultError::Storage)?;
-        Ok(())
+        self.enforce_owner_private_state_files()
     }
 
     /// Runs `SQLite` structural integrity checks before serving requests.
@@ -559,7 +565,14 @@ impl Storage {
                  PRAGMA trusted_schema = OFF;",
             )
             .map_err(|_| VaultError::Storage)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            path: path.to_owned(),
+        })
+    }
+
+    fn enforce_owner_private_state_files(&self) -> Result<()> {
+        enforce_owner_private_sqlite_state(&self.path)
     }
 
     fn initialize_schema(&self) -> Result<()> {
@@ -680,7 +693,7 @@ impl Storage {
             )
             .map_err(|_| VaultError::Storage)?;
         transaction.commit().map_err(|_| VaultError::Storage)?;
-        Ok(())
+        self.enforce_owner_private_state_files()
     }
 
     fn insert_streaming_placeholder(
@@ -825,7 +838,8 @@ impl StreamingPublication<'_> {
                 ],
             )
             .map_err(|_| VaultError::Storage)?;
-        self.transaction.commit().map_err(|_| VaultError::Storage)
+        self.transaction.commit().map_err(|_| VaultError::Storage)?;
+        enforce_owner_private_sqlite_state(self.state_path)
     }
 }
 

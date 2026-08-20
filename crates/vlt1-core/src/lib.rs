@@ -20,6 +20,7 @@ mod cde;
 mod crypto;
 mod error;
 mod format;
+mod private_file;
 mod storage;
 mod vault;
 mod witness;
@@ -27,6 +28,10 @@ mod witness;
 pub use crate::backup::{manifest_path, BackupManifest};
 pub use crate::error::{Result, VaultError};
 pub use crate::format::{ObjectId, VaultId, VersionId};
+pub use crate::private_file::{
+    enforce_owner_private_file, enforce_owner_private_optional_file,
+    enforce_owner_private_sqlite_state,
+};
 pub use crate::vault::{Vault, VaultStatus, DEFAULT_CHUNK_SIZE, MAX_CHUNKS_PER_VERSION};
 pub use crate::witness::{
     random_witness_challenge, HttpsWitnessProvider, InMemoryTestProvider, WitnessHead,

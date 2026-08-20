@@ -10,13 +10,14 @@
 //! material to return the same receipt after an uncertain client retry.
 #![forbid(unsafe_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use vlt1_core::{
-    ObjectId, VaultError, VaultId, VersionId, WitnessHead, WitnessReceipt, WitnessRequest,
+    enforce_owner_private_sqlite_state, ObjectId, VaultError, VaultId, VersionId, WitnessHead,
+    WitnessReceipt, WitnessRequest,
 };
 
 /// Maximum accepted JSON body size for either witness endpoint.
@@ -93,6 +94,7 @@ pub struct HeadResponse {
 /// Independently persisted witness state and signing capability.
 pub struct WitnessService {
     connection: Connection,
+    path: PathBuf,
     signing_key: SigningKey,
 }
 
@@ -103,6 +105,7 @@ impl WitnessService {
     ///
     /// Returns an error when the database cannot be opened or initialized.
     pub fn open(path: impl AsRef<Path>, signing_key: SigningKey) -> Result<Self, VaultError> {
+        let path = path.as_ref();
         let connection = Connection::open(path).map_err(|_| VaultError::Storage)?;
         let journal_mode: String = connection
             .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
@@ -130,8 +133,10 @@ impl WitnessService {
                  );",
             )
             .map_err(|_| VaultError::Storage)?;
+        enforce_owner_private_sqlite_state(path)?;
         Ok(Self {
             connection,
+            path: path.to_owned(),
             signing_key,
         })
     }
@@ -202,6 +207,7 @@ impl WitnessService {
             )
             .map_err(|_| VaultError::Storage)?;
         transaction.commit().map_err(|_| VaultError::Storage)?;
+        enforce_owner_private_sqlite_state(&self.path)?;
         Ok(IssueResponse::from(&receipt))
     }
 
