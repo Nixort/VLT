@@ -210,6 +210,46 @@ impl Vault {
         result
     }
 
+    /// Encrypts, stages, witnesses, and publishes one immutable version from a streaming reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault is locked, the reader fails, an input
+    /// exceeds the chunk policy, the witness rejects or fails to sign the
+    /// version commitment, or publication cannot commit.
+    pub fn put_from_reader_with_witness<R: Read, P: WitnessProvider>(
+        &mut self,
+        object_id: ObjectId,
+        reader: &mut R,
+        provider: &mut P,
+    ) -> Result<VersionId> {
+        self.put_from_reader_with_chunk_size_and_witness(
+            object_id,
+            reader,
+            DEFAULT_CHUNK_SIZE,
+            provider,
+        )
+    }
+
+    /// Streaming witness-backed `put` variant with an explicit chunk size.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::put_from_reader_with_witness`], plus
+    /// an error for an invalid chunk size.
+    pub fn put_from_reader_with_chunk_size_and_witness<R: Read, P: WitnessProvider>(
+        &mut self,
+        object_id: ObjectId,
+        reader: &mut R,
+        chunk_size: usize,
+        provider: &mut P,
+    ) -> Result<VersionId> {
+        let result =
+            self.put_from_reader_with_witness_inner(object_id, reader, chunk_size, provider);
+        self.lock_after_failure(&result);
+        result
+    }
+
     /// Verifies every active immutable version without returning its plaintext.
     ///
     /// # Errors
@@ -325,6 +365,23 @@ impl Vault {
         result
     }
 
+    /// Verifies the fresh external witness head for one object and returns its plaintext.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault is locked, the object is absent, the
+    /// external witness head is missing or mismatches the local receipt, or
+    /// authenticated decryption fails.
+    pub fn get_with_witness<P: WitnessProvider>(
+        &mut self,
+        object_id: ObjectId,
+        provider: &mut P,
+    ) -> Result<Vec<u8>> {
+        let result = self.get_with_witness_inner(object_id, provider);
+        self.lock_after_failure(&result);
+        result
+    }
+
     /// Verifies and writes the active immutable version to a plaintext sink.
     ///
     /// The caller receives data only after the encrypted chunk layout and digest
@@ -338,6 +395,24 @@ impl Vault {
     /// record fails verification, or the output sink cannot be written.
     pub fn get_to_writer<W: Write>(&mut self, object_id: ObjectId, writer: &mut W) -> Result<()> {
         let result = self.get_to_writer_inner(object_id, writer);
+        self.lock_after_failure(&result);
+        result
+    }
+
+    /// Verifies the fresh external witness head for one object and writes its plaintext to a sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault is locked, the object is absent, the
+    /// external witness head is missing or mismatches the local receipt, a
+    /// record fails verification, or the output sink cannot be written.
+    pub fn get_to_writer_with_witness<W: Write, P: WitnessProvider>(
+        &mut self,
+        object_id: ObjectId,
+        writer: &mut W,
+        provider: &mut P,
+    ) -> Result<()> {
+        let result = self.get_to_writer_with_witness_inner(object_id, writer, provider);
         self.lock_after_failure(&result);
         result
     }
@@ -476,6 +551,113 @@ impl Vault {
         result
     }
 
+    fn put_from_reader_with_witness_inner<R: Read, P: WitnessProvider>(
+        &mut self,
+        object_id: ObjectId,
+        reader: &mut R,
+        chunk_size: usize,
+        provider: &mut P,
+    ) -> Result<VersionId> {
+        if chunk_size == 0 {
+            return Err(VaultError::InvalidInput("invalid chunk size"));
+        }
+        let chunk_size_u32 = u32::try_from(chunk_size)
+            .map_err(|_| VaultError::InvalidInput("invalid chunk size"))?;
+        let root_key = Zeroizing::new(*self.require_root_key()?);
+        let expected_epoch = self.verify_pre_publication_head(object_id, provider)?;
+        let version_id = VersionId::random();
+        let mut data_key = generate_dek();
+        let staged_result = (|| {
+            let mut wrapping_key = derive_kek(&root_key, self.envelope.vault_id)?;
+            let wrapped_dek = seal(
+                &wrapping_key[..],
+                &wrapped_dek_aad(self.envelope.vault_id, object_id, version_id),
+                &data_key[..],
+            )?;
+            wrapping_key.zeroize();
+
+            let mut publication = self.storage.begin_streaming_publication(
+                object_id,
+                version_id,
+                &wrapped_dek,
+                chunk_size_u32,
+            )?;
+            let mut buffer = Zeroizing::new(vec![0u8; chunk_size]);
+            let mut digest = ChunkDigestBuilder::new();
+            let mut chunk_count = 0u32;
+            let mut plaintext_len = 0u64;
+            loop {
+                let read = read_next_chunk(reader, &mut buffer[..])?;
+                if read == 0 {
+                    break;
+                }
+                if chunk_count >= MAX_CHUNKS_PER_VERSION {
+                    buffer[..read].zeroize();
+                    return Err(VaultError::InvalidInput("nonce budget exceeded"));
+                }
+                let chunk_len =
+                    u32::try_from(read).map_err(|_| VaultError::InvalidInput("chunk length"))?;
+                let aad = chunk_aad(
+                    self.envelope.vault_id,
+                    object_id,
+                    version_id,
+                    chunk_count,
+                    chunk_len,
+                );
+                let record = seal(&data_key[..], &aad, &buffer[..read])?;
+                buffer[..read].zeroize();
+                digest.update(chunk_count, &record);
+                publication.append_chunk(
+                    &EncryptedChunk {
+                        index: chunk_count,
+                        record,
+                    },
+                    chunk_len,
+                )?;
+                plaintext_len = plaintext_len
+                    .checked_add(u64::from(chunk_len))
+                    .ok_or(VaultError::InvalidInput("plaintext length exceeds u64"))?;
+                chunk_count = chunk_count
+                    .checked_add(1)
+                    .ok_or(VaultError::InvalidInput("too many chunks"))?;
+            }
+            buffer.zeroize();
+
+            let manifest = Manifest {
+                format_version: FORMAT_VERSION,
+                object_id,
+                version_id,
+                plaintext_len,
+                chunk_size: chunk_size_u32,
+                chunk_count,
+                chunk_digest: digest.finalize(),
+            };
+            let manifest_bytes = encode_manifest(&manifest);
+            let mut manifest_key = derive_manifest_key(&data_key, version_id)?;
+            let manifest = seal(
+                &manifest_key[..],
+                &manifest_aad(self.envelope.vault_id, object_id, version_id),
+                &manifest_bytes,
+            )?;
+            manifest_key.zeroize();
+            publication.stage_for_witness(&manifest, chunk_count, expected_epoch)
+        })();
+        data_key.zeroize();
+        let stored_version = staged_result?;
+
+        let request = WitnessRequest::new(
+            self.envelope.vault_id,
+            object_id,
+            version_id,
+            &stored_version.manifest,
+        );
+        let receipt = provider.issue_receipt(&request, expected_epoch)?;
+        receipt.verify_request(&request)?;
+        self.storage
+            .finalize_witness_publication(&stored_version, &receipt)?;
+        Ok(version_id)
+    }
+
     fn put_with_witness_inner<P: WitnessProvider>(
         &mut self,
         object_id: ObjectId,
@@ -483,6 +665,7 @@ impl Vault {
         provider: &mut P,
     ) -> Result<VersionId> {
         let prepared = self.prepare_version(object_id, plaintext, DEFAULT_CHUNK_SIZE)?;
+        let expected_epoch = self.verify_pre_publication_head(object_id, provider)?;
         let version_id = prepared.stored_version.version_id;
         let request = WitnessRequest::new(
             self.envelope.vault_id,
@@ -490,10 +673,6 @@ impl Vault {
             version_id,
             &prepared.stored_version.manifest,
         );
-        let expected_epoch = self
-            .storage
-            .active_receipt(object_id)?
-            .map_or(0, |receipt| receipt.witness_epoch());
         self.storage.stage_witness_publication(
             &prepared.stored_version,
             &prepared.chunks,
@@ -546,12 +725,23 @@ impl Vault {
         let _ = self.require_root_key()?;
         let object_ids = self.storage.active_object_ids()?;
         for object_id in &object_ids {
-            let receipt = self
-                .storage
-                .active_receipt(*object_id)?
-                .ok_or(VaultError::WitnessConflict)?;
-            let challenge = crate::witness::random_witness_challenge();
-            let head = provider.object_head(self.envelope.vault_id, *object_id, challenge)?;
+            self.verify_object_witness_head(*object_id, provider)?;
+            let mut sink = std::io::sink();
+            self.get_to_writer_inner(*object_id, &mut sink)?;
+        }
+        u64::try_from(object_ids.len())
+            .map_err(|_| VaultError::Invariant("active object count exceeds u64"))
+    }
+
+    fn verify_pre_publication_head<P: WitnessProvider>(
+        &self,
+        object_id: ObjectId,
+        provider: &mut P,
+    ) -> Result<u64> {
+        let local_receipt = self.storage.active_receipt(object_id)?;
+        let challenge = crate::witness::random_witness_challenge();
+        let head = provider.object_head(self.envelope.vault_id, object_id, challenge)?;
+        if let Some(receipt) = local_receipt {
             if !head.present()
                 || head.version_id() != Some(receipt.version_id())
                 || head.witness_epoch() != receipt.witness_epoch()
@@ -560,11 +750,35 @@ impl Vault {
             {
                 return Err(VaultError::WitnessConflict);
             }
-            let mut sink = std::io::sink();
-            self.get_to_writer_inner(*object_id, &mut sink)?;
+            Ok(receipt.witness_epoch())
+        } else {
+            if head.present() || head.witness_epoch() != 0 {
+                return Err(VaultError::WitnessConflict);
+            }
+            Ok(0)
         }
-        u64::try_from(object_ids.len())
-            .map_err(|_| VaultError::Invariant("active object count exceeds u64"))
+    }
+
+    fn verify_object_witness_head<P: WitnessProvider>(
+        &self,
+        object_id: ObjectId,
+        provider: &mut P,
+    ) -> Result<()> {
+        let receipt = self
+            .storage
+            .active_receipt(object_id)?
+            .ok_or(VaultError::WitnessConflict)?;
+        let challenge = crate::witness::random_witness_challenge();
+        let head = provider.object_head(self.envelope.vault_id, object_id, challenge)?;
+        if !head.present()
+            || head.version_id() != Some(receipt.version_id())
+            || head.witness_epoch() != receipt.witness_epoch()
+            || head.commitment() != Some(receipt.commitment())
+            || head.public_key() != receipt.public_key()
+        {
+            return Err(VaultError::WitnessConflict);
+        }
+        Ok(())
     }
 
     fn prepare_version(
@@ -657,6 +871,28 @@ impl Vault {
         let mut plaintext = Vec::new();
         self.get_to_writer_inner(object_id, &mut plaintext)?;
         Ok(plaintext)
+    }
+
+    fn get_with_witness_inner<P: WitnessProvider>(
+        &mut self,
+        object_id: ObjectId,
+        provider: &mut P,
+    ) -> Result<Vec<u8>> {
+        let mut plaintext = Vec::new();
+        self.get_to_writer_with_witness_inner(object_id, &mut plaintext, provider)?;
+        Ok(plaintext)
+    }
+
+    fn get_to_writer_with_witness_inner<W: Write, P: WitnessProvider>(
+        &mut self,
+        object_id: ObjectId,
+        writer: &mut W,
+        provider: &mut P,
+    ) -> Result<()> {
+        let _ = self.require_root_key()?;
+        let _ = self.storage.active_version(object_id)?;
+        self.verify_object_witness_head(object_id, provider)?;
+        self.get_to_writer_inner(object_id, writer)
     }
 
     fn get_to_writer_inner<W: Write>(&mut self, object_id: ObjectId, writer: &mut W) -> Result<()> {

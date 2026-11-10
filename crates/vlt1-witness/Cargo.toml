@@ -18,7 +18,7 @@ workspace = true
 anyhow = "=1.0.103"
 clap = { version = "=4.5.1", features = ["derive"] }
 constant_time_eq = "=0.3.1"
-ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
+ed25519-dalek = { version = "=2.1.1", features = ["rand_core", "zeroize"] }
 hex = "=0.4.3"
 rand = "=0.8.6"
 rusqlite = { version = "=0.31.0", features = ["bundled"] }

@@ -9,6 +9,7 @@ use std::{fs, path::PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use vlt1_daemon::{Daemon, DaemonConfig, WitnessConfig};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(name = "vlt1d", version, about = "VLT/1 local Unix-socket daemon")]
@@ -80,7 +81,7 @@ fn witness_config(
             }
             Ok(Some(WitnessConfig {
                 endpoint,
-                bearer_token: token,
+                bearer_token: (*token).clone(),
                 public_key,
                 previous_public_key,
             }))
@@ -91,7 +92,7 @@ fn witness_config(
     }
 }
 
-fn read_secret(path: &PathBuf) -> Result<String> {
+fn read_secret(path: &PathBuf) -> Result<Zeroizing<String>> {
     let metadata = fs::metadata(path).with_context(|| format!("cannot stat {}", path.display()))?;
     if !metadata.is_file() {
         bail!("{} is not a regular file", path.display());
@@ -103,9 +104,10 @@ fn read_secret(path: &PathBuf) -> Result<String> {
             bail!("{} must not be readable by group or other", path.display());
         }
     }
-    let content =
-        fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let content = content.trim().to_owned();
+    let raw = Zeroizing::new(
+        fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?,
+    );
+    let content = Zeroizing::new(raw.trim().to_owned());
     if content.is_empty() {
         bail!("{} is empty", path.display());
     }
