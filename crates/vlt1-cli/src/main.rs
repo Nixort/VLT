@@ -20,7 +20,7 @@ use vlt1_protocol::{
     read_frame, read_stream_item, write_frame, write_stream_chunk, write_stream_end, Request,
     Response, StreamItem, Success, MAX_STREAM_CHUNK_BYTES,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Parser)]
 #[command(name = "vlt1", version, about = "VLT/1 local daemon client")]
@@ -148,18 +148,7 @@ fn main() -> Result<()> {
 }
 
 fn init(path: &Path) -> Result<()> {
-    if path.exists() {
-        bail!("refusing to overwrite existing vault: {}", path.display());
-    }
-    let parent = path
-        .parent()
-        .context("vault path has no parent directory")?;
-    if !parent.exists() {
-        bail!(
-            "vault parent directory does not exist: {}",
-            parent.display()
-        );
-    }
+    validate_new_vault_destination(path)?;
     let passphrase = prompt_new_passphrase()?;
     let vault = Vault::create(path, &passphrase).context("could not create VLT/1 vault")?;
     println!("created VLT/1 vault");
@@ -192,7 +181,10 @@ fn status(socket: &Path) -> Result<()> {
 
 fn unlock(socket: &Path) -> Result<()> {
     let passphrase = prompt_password("Vault passphrase: ")?;
-    empty(socket, &Request::Unlock { passphrase }, "vault unlocked")
+    let mut request = Request::Unlock { passphrase };
+    let result = empty(socket, &request, "vault unlocked");
+    zeroize_request(&mut request);
+    result
 }
 
 fn put(socket: &Path, object_id: &str, input: &Path) -> Result<()> {
@@ -421,17 +413,55 @@ fn validate_new_plaintext_output(output: &Path) -> Result<&Path> {
     }
 }
 
+fn validate_new_vault_destination(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("vault path has no parent directory")?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    for ancestor in parent
+        .ancestors()
+        .filter(|item| !item.as_os_str().is_empty())
+    {
+        let metadata = fs::symlink_metadata(ancestor).with_context(|| {
+            format!(
+                "vault parent directory does not exist: {}",
+                ancestor.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            bail!(
+                "vault parent must be a direct directory path: {}",
+                ancestor.display()
+            );
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => bail!("refusing to overwrite existing vault: {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("could not inspect vault path: {}", path.display()))
+        }
+    }
+}
+
 fn rotate_passphrase(socket: &Path) -> Result<()> {
     let current_passphrase = prompt_password("Current passphrase: ")?;
     let replacement_passphrase = prompt_new_passphrase()?;
-    empty(
+    let mut request = Request::RotatePassphrase {
+        current_passphrase,
+        replacement_passphrase: (*replacement_passphrase).clone(),
+    };
+    let result = empty(
         socket,
-        &Request::RotatePassphrase {
-            current_passphrase,
-            replacement_passphrase,
-        },
+        &request,
         "passphrase rotated; daemon vault is locked",
-    )
+    );
+    zeroize_request(&mut request);
+    result
 }
 
 fn verify(socket: &Path) -> Result<()> {
@@ -473,16 +503,30 @@ fn response_to_result(response: Response) -> Result<Success> {
     }
 }
 
-fn prompt_new_passphrase() -> Result<String> {
-    let first = prompt_password("New passphrase: ")?;
+fn prompt_new_passphrase() -> Result<Zeroizing<String>> {
+    let first = Zeroizing::new(prompt_password("New passphrase: ")?);
     if first.is_empty() {
         bail!("passphrase must not be empty");
     }
-    let second = prompt_password("Confirm passphrase: ")?;
+    let second = Zeroizing::new(prompt_password("Confirm passphrase: ")?);
     if first != second {
         bail!("passphrase confirmation does not match");
     }
     Ok(first)
+}
+
+fn zeroize_request(request: &mut Request) {
+    match request {
+        Request::Unlock { passphrase } => passphrase.zeroize(),
+        Request::RotatePassphrase {
+            current_passphrase,
+            replacement_passphrase,
+        } => {
+            current_passphrase.zeroize();
+            replacement_passphrase.zeroize();
+        }
+        _ => {}
+    }
 }
 
 trait ErrorCodeText {

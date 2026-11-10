@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "fault-injection")]
 use std::cell::Cell;
 
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Transaction};
+use rusqlite::{
+    params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
+};
 
 use crate::{
     backup::{create_snapshot, restore_snapshot, BackupManifest},
@@ -63,6 +65,8 @@ pub(crate) struct StreamingPublication<'connection> {
     state_path: &'connection Path,
     object_id: ObjectId,
     version_id: VersionId,
+    wrapped_dek: SealedRecord,
+    chunk_size: u32,
     next_chunk_index: u32,
     plaintext_len: u64,
 }
@@ -198,7 +202,7 @@ impl Storage {
     ) -> Result<StreamingPublication<'_>> {
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| VaultError::Storage)?;
         Self::insert_streaming_placeholder(
             &transaction,
@@ -212,6 +216,8 @@ impl Storage {
             state_path: &self.path,
             object_id,
             version_id,
+            wrapped_dek: wrapped_dek.clone(),
+            chunk_size,
             next_chunk_index: 0,
             plaintext_len: 0,
         })
@@ -235,7 +241,7 @@ impl Storage {
         }
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| VaultError::Storage)?;
         Self::insert_version(&transaction, version)?;
         for chunk in chunks {
@@ -291,7 +297,7 @@ impl Storage {
         }
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| VaultError::Storage)?;
         let staged: Option<u64> = transaction
             .query_row(
@@ -676,7 +682,7 @@ impl Storage {
         }
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| VaultError::Storage)?;
         Self::insert_version(&transaction, version)?;
         for chunk in chunks {
@@ -843,6 +849,53 @@ impl StreamingPublication<'_> {
             .map_err(|_| VaultError::Storage)?;
         self.transaction.commit().map_err(|_| VaultError::Storage)?;
         enforce_owner_private_sqlite_state(self.state_path)
+    }
+
+    /// Persists the streamed version in the pending witness table without advancing the active pointer.
+    pub(crate) fn stage_for_witness(
+        self,
+        manifest: &SealedRecord,
+        chunk_count: u32,
+        expected_epoch: u64,
+    ) -> Result<StoredVersion> {
+        if chunk_count != self.next_chunk_index {
+            return Err(VaultError::Invariant("streamed Manifest chunk count"));
+        }
+        let changed = self
+            .transaction
+            .execute(
+                "UPDATE versions SET manifest_nonce = ?1, manifest_ciphertext = ?2, \
+                 plaintext_len = ?3, chunk_count = ?4 WHERE version_id = ?5 AND object_id = ?6",
+                params![
+                    manifest.nonce.as_slice(),
+                    manifest.ciphertext,
+                    self.plaintext_len,
+                    chunk_count,
+                    self.version_id.as_bytes().as_slice(),
+                    self.object_id.as_bytes().as_slice(),
+                ],
+            )
+            .map_err(|_| VaultError::Storage)?;
+        if changed != 1 {
+            return Err(VaultError::Invariant("streamed version finalization"));
+        }
+        self.transaction
+            .execute(
+                "INSERT INTO pending_witness_publications(version_id, expected_epoch) VALUES(?1, ?2)",
+                params![self.version_id.as_bytes().as_slice(), expected_epoch],
+            )
+            .map_err(|_| VaultError::Storage)?;
+        self.transaction.commit().map_err(|_| VaultError::Storage)?;
+        enforce_owner_private_sqlite_state(self.state_path)?;
+        Ok(StoredVersion {
+            object_id: self.object_id,
+            version_id: self.version_id,
+            wrapped_dek: self.wrapped_dek,
+            manifest: manifest.clone(),
+            plaintext_len: self.plaintext_len,
+            chunk_size: self.chunk_size,
+            chunk_count,
+        })
     }
 }
 

@@ -769,6 +769,7 @@ impl IssueWireRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IssueWireResponse {
     vault_id: String,
     object_id: String,
@@ -801,6 +802,7 @@ struct HeadWireRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HeadWireResponse {
     vault_id: String,
     object_id: String,

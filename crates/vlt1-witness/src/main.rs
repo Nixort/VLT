@@ -20,6 +20,7 @@ use constant_time_eq::constant_time_eq;
 use ed25519_dalek::SigningKey;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 use vlt1_witness::{HeadRequest, IssueRequest, WitnessService, MAX_WIRE_BODY};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,8 +48,11 @@ fn main() -> Result<()> {
     if !is_loopback(arguments.listen.ip()) {
         bail!("vlt1-witnessd accepts only a loopback listener; terminate TLS outside it");
     }
-    let signing_key = SigningKey::from_bytes(&read_fixed_secret::<32>(&arguments.signing_seed)?);
-    let token = read_secret(&arguments.auth_token_file)?;
+    let seed = Zeroizing::new(read_fixed_secret::<32>(&arguments.signing_seed)?);
+    let signing_key = SigningKey::from_bytes(&seed);
+    let token = Zeroizing::new(read_secret(&arguments.auth_token_file)?);
+    let expected_authorization =
+        Zeroizing::new(format!("Bearer {}", String::from_utf8_lossy(&token)));
     let mut service = WitnessService::open(&arguments.state, signing_key)
         .context("could not open VLT/1 witness state")?;
     let server = Server::http(arguments.listen)
@@ -56,7 +60,7 @@ fn main() -> Result<()> {
     eprintln!("vlt1-witnessd listening on {}", server.server_addr());
 
     for mut request in server.incoming_requests() {
-        let response = if authorized(&request, &token) {
+        let response = if authorized(&request, expected_authorization.as_bytes()) {
             dispatch(&mut service, &mut request)
         } else {
             json_response(StatusCode(401), br#"{"error":"unauthorized"}"#)
@@ -93,8 +97,7 @@ fn dispatch(
     }
 }
 
-fn authorized(request: &tiny_http::Request, token: &[u8]) -> bool {
-    let expected = format!("Bearer {}", String::from_utf8_lossy(token));
+fn authorized(request: &tiny_http::Request, expected_authorization: &[u8]) -> bool {
     let Some(header) = request
         .headers()
         .iter()
@@ -102,7 +105,7 @@ fn authorized(request: &tiny_http::Request, token: &[u8]) -> bool {
     else {
         return false;
     };
-    constant_time_eq(header.value.as_bytes(), expected.as_bytes())
+    constant_time_eq(header.value.as_bytes(), expected_authorization)
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(request: &mut tiny_http::Request) -> Result<T, ()> {
@@ -138,8 +141,9 @@ fn json_response(status: StatusCode, body: &[u8]) -> Response<std::io::Cursor<Ve
 }
 
 fn read_fixed_secret<const N: usize>(path: &PathBuf) -> Result<[u8; N]> {
-    let bytes = read_secret(path)?;
+    let bytes = Zeroizing::new(read_secret(path)?);
     bytes
+        .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("{} must contain exactly {N} raw bytes", path.display()))
 }
