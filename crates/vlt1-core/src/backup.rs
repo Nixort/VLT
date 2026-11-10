@@ -35,6 +35,7 @@ const BACKUP_FORMAT: &str = "VLT/1 encrypted SQLite backup v1";
 /// distinguish it from the encrypted object Manifest without importing this module.
 #[allow(clippy::module_name_repetitions)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupManifest {
     format: String,
     vault_id: String,

@@ -303,7 +303,11 @@ impl Daemon {
         }
         match request {
             Request::Status => self.status(),
-            Request::Unlock { passphrase } => self.unlock(&passphrase),
+            Request::Unlock { mut passphrase } => {
+                let response = self.unlock(&passphrase);
+                passphrase.zeroize();
+                response
+            }
             Request::Lock => self.with_vault(|vault| {
                 vault.lock();
                 Ok(Success::Empty)
@@ -320,12 +324,17 @@ impl Daemon {
                 ),
             },
             Request::RotatePassphrase {
-                current_passphrase,
-                replacement_passphrase,
-            } => self.with_vault(|vault| {
-                vault.rotate_passphrase(&current_passphrase, &replacement_passphrase)?;
-                Ok(Success::Empty)
-            }),
+                mut current_passphrase,
+                mut replacement_passphrase,
+            } => {
+                let response = self.with_vault(|vault| {
+                    vault.rotate_passphrase(&current_passphrase, &replacement_passphrase)?;
+                    Ok(Success::Empty)
+                });
+                current_passphrase.zeroize();
+                replacement_passphrase.zeroize();
+                response
+            }
             Request::Verify => self.verify(),
             Request::Checkpoint => self.with_vault(|vault| {
                 vault.full_checkpoint()?;
@@ -381,12 +390,22 @@ impl Daemon {
 
     fn unlock(&self, passphrase: &str) -> Response {
         if self.state.witness.is_some() {
-            self.with_witness(|vault, witness| {
+            let result = self.with_witness_result(|vault, witness| {
                 vault.unlock(passphrase)?;
                 vault.recover_pending_witness_publications(witness)?;
-                vault.verify_active_objects_with_witness(witness)?;
-                Ok(Success::Empty)
-            })
+                vault.verify_active_objects_with_witness(witness)
+            });
+            match result {
+                Ok(active_objects) => {
+                    self.set_verified_active_objects(Some(active_objects));
+                    Response::Ok {
+                        result: Success::Empty,
+                    }
+                }
+                Err(error) => Response::Error {
+                    error: map_vault_error(&error),
+                },
+            }
         } else {
             self.with_vault(|vault| {
                 vault.unlock(passphrase)?;
@@ -443,12 +462,12 @@ impl Daemon {
             Ok(object_id) => object_id,
             Err(response) => return response,
         };
-        let Ok(plaintext) = STANDARD.decode(plaintext_b64) else {
+        let Ok(mut plaintext) = STANDARD.decode(plaintext_b64) else {
             return Response::Error {
                 error: failure(ErrorCode::InvalidInput, "plaintext is not valid base64"),
             };
         };
-        if self.state.witness.is_some() {
+        let response = if self.state.witness.is_some() {
             self.with_witness(|vault, witness| {
                 let version = vault.put_with_witness(object_id, &plaintext, witness)?;
                 Ok(Success::Published {
@@ -462,7 +481,9 @@ impl Daemon {
                     version_id: version.to_hex(),
                 })
             })
-        }
+        };
+        plaintext.zeroize();
+        response
     }
 
     fn put_stream(&self, stream: &mut UnixStream, object_id: &str) -> io::Result<()> {
@@ -482,7 +503,14 @@ impl Daemon {
                 result: Success::StreamReady,
             },
         )?;
-        let result = {
+        let result = if let Some(witness) = &self.state.witness {
+            let Ok(mut witness) = witness.lock() else {
+                return write_stream_failure(
+                    stream,
+                    ErrorCode::Internal,
+                    "witness state is unavailable",
+                );
+            };
             let Ok(mut vault) = self.state.vault.lock() else {
                 return write_stream_failure(
                     stream,
@@ -491,7 +519,21 @@ impl Daemon {
                 );
             };
             let mut reader = StreamReader::new(stream);
-            vault.put_from_reader(object_id, &mut reader)
+            let result = vault.put_from_reader_with_witness(object_id, &mut reader, &mut *witness);
+            self.sync_verified_state(&vault);
+            result
+        } else {
+            let Ok(mut vault) = self.state.vault.lock() else {
+                return write_stream_failure(
+                    stream,
+                    ErrorCode::Internal,
+                    "daemon state is unavailable",
+                );
+            };
+            let mut reader = StreamReader::new(stream);
+            let result = vault.put_from_reader(object_id, &mut reader);
+            self.sync_verified_state(&vault);
+            result
         };
         match result {
             Ok(version_id) => write_response(
@@ -528,7 +570,14 @@ impl Daemon {
                 result: Success::StreamReady,
             },
         )?;
-        let result = {
+        let result = if let Some(witness) = &self.state.witness {
+            let Ok(mut witness) = witness.lock() else {
+                return write_stream_failure(
+                    stream,
+                    ErrorCode::Internal,
+                    "witness state is unavailable",
+                );
+            };
             let Ok(mut vault) = self.state.vault.lock() else {
                 return write_stream_failure(
                     stream,
@@ -537,7 +586,21 @@ impl Daemon {
                 );
             };
             let mut writer = StreamWriter::new(stream);
-            vault.get_to_writer(object_id, &mut writer)
+            let result = vault.get_to_writer_with_witness(object_id, &mut writer, &mut *witness);
+            self.sync_verified_state(&vault);
+            result
+        } else {
+            let Ok(mut vault) = self.state.vault.lock() else {
+                return write_stream_failure(
+                    stream,
+                    ErrorCode::Internal,
+                    "daemon state is unavailable",
+                );
+            };
+            let mut writer = StreamWriter::new(stream);
+            let result = vault.get_to_writer(object_id, &mut writer);
+            self.sync_verified_state(&vault);
+            result
         };
         match result {
             Ok(()) => write_stream_end(stream)
@@ -558,18 +621,17 @@ impl Daemon {
         };
         if self.state.witness.is_some() {
             self.with_witness(|vault, witness| {
-                vault.verify_active_objects_with_witness(witness)?;
-                let plaintext = vault.get(object_id)?;
-                Ok(Success::Plaintext {
-                    plaintext_b64: STANDARD.encode(plaintext),
-                })
+                let mut plaintext = vault.get_with_witness(object_id, witness)?;
+                let plaintext_b64 = STANDARD.encode(&plaintext);
+                plaintext.zeroize();
+                Ok(Success::Plaintext { plaintext_b64 })
             })
         } else {
             self.with_vault(|vault| {
-                let plaintext = vault.get(object_id)?;
-                Ok(Success::Plaintext {
-                    plaintext_b64: STANDARD.encode(plaintext),
-                })
+                let mut plaintext = vault.get(object_id)?;
+                let plaintext_b64 = STANDARD.encode(&plaintext);
+                plaintext.zeroize();
+                Ok(Success::Plaintext { plaintext_b64 })
             })
         }
     }
@@ -593,7 +655,9 @@ impl Daemon {
                 error: failure(ErrorCode::Internal, "daemon state is unavailable"),
             };
         };
-        match operation(&mut vault, &mut witness) {
+        let result = operation(&mut vault, &mut witness);
+        self.sync_verified_state(&vault);
+        match result {
             Ok(result) => Response::Ok { result },
             Err(error) => Response::Error {
                 error: map_vault_error(&error),
@@ -612,7 +676,9 @@ impl Daemon {
             .ok_or(VaultError::WitnessUnavailable)?;
         let mut witness = witness.lock().map_err(|_| VaultError::Storage)?;
         let mut vault = self.state.vault.lock().map_err(|_| VaultError::Storage)?;
-        operation(&mut vault, &mut witness)
+        let result = operation(&mut vault, &mut witness);
+        self.sync_verified_state(&vault);
+        result
     }
 
     fn with_vault_result<F>(&self, operation: F) -> Result<u64, VaultError>
@@ -620,7 +686,9 @@ impl Daemon {
         F: FnOnce(&mut Vault) -> Result<u64, VaultError>,
     {
         let mut vault = self.state.vault.lock().map_err(|_| VaultError::Storage)?;
-        operation(&mut vault)
+        let result = operation(&mut vault);
+        self.sync_verified_state(&vault);
+        result
     }
 
     fn with_vault<F>(&self, operation: F) -> Response
@@ -632,11 +700,25 @@ impl Daemon {
                 error: failure(ErrorCode::Internal, "daemon state is unavailable"),
             };
         };
-        match operation(&mut vault) {
+        let result = operation(&mut vault);
+        self.sync_verified_state(&vault);
+        match result {
             Ok(result) => Response::Ok { result },
             Err(error) => Response::Error {
                 error: map_vault_error(&error),
             },
+        }
+    }
+
+    fn sync_verified_state(&self, vault: &Vault) {
+        if vault.status() == VaultStatus::Locked {
+            self.set_verified_active_objects(None);
+        }
+    }
+
+    fn set_verified_active_objects(&self, verified: Option<u64>) {
+        if let Ok(mut recovery) = self.state.recovery.lock() {
+            recovery.verified_active_objects = verified;
         }
     }
 }

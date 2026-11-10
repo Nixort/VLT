@@ -107,6 +107,14 @@ fn authorised_local_client_executes_a_full_vault_flow() {
     ));
 
     assert_eq!(call(&socket_path, &Request::Lock), Success::Empty);
+    let locked_status = call(&socket_path, &Request::Status);
+    assert!(matches!(
+        locked_status,
+        Success::Status {
+            verified_active_objects: None,
+            ..
+        }
+    ));
     let locked_read = call_response(
         &socket_path,
         &Request::Get {

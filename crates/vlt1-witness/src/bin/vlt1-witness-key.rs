@@ -9,6 +9,7 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -29,10 +30,14 @@ fn main() -> Result<()> {
     if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
         bail!("witness signing seed must be a regular mode-0600 file");
     }
-    let seed = fs::read(&arguments.signing_seed)
-        .with_context(|| format!("cannot read {}", arguments.signing_seed.display()))?;
-    let seed: [u8; 32] = seed
+    let seed = Zeroizing::new(
+        fs::read(&arguments.signing_seed)
+            .with_context(|| format!("cannot read {}", arguments.signing_seed.display()))?,
+    );
+    let seed: Zeroizing<[u8; 32]> = seed
+        .as_slice()
         .try_into()
+        .map(Zeroizing::new)
         .map_err(|_| anyhow::anyhow!("witness signing seed must be exactly 32 bytes"))?;
     println!(
         "{}",

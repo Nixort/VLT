@@ -16,7 +16,7 @@ use std::{
 };
 
 use ed25519_dalek::SigningKey;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use vlt1_core::{
     enforce_owner_private_sqlite_state, ObjectId, VaultError, VaultId, VersionId, WitnessHead,
@@ -28,6 +28,7 @@ pub const MAX_WIRE_BODY: u64 = 16 * 1024;
 
 /// JSON request for `POST /v1/issue`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssueRequest {
     /// Lowercase hexadecimal vault ID.
     pub vault_id: String,
@@ -62,6 +63,7 @@ pub struct IssueResponse {
 
 /// JSON request for `POST /v1/head`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeadRequest {
     /// Lowercase hexadecimal vault ID.
     pub vault_id: String,
@@ -166,7 +168,7 @@ impl WitnessService {
         let public_key = self.public_key();
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| VaultError::Storage)?;
         let current = load_receipt(
             &transaction,

@@ -128,7 +128,7 @@ fn streaming_read_writes_nothing_before_digest_verification() {
         .expect("unlock before streaming verification");
     let mut output = Vec::new();
     assert!(reopened.get_to_writer(object, &mut output).is_err());
-    assert!(output.is_empty());
+    assert_eq!(output, Vec::<u8>::new());
     assert_eq!(reopened.status(), VaultStatus::Locked);
 }
 
@@ -378,4 +378,32 @@ fn vault_and_backup_paths_reject_symlinks_and_unsafe_parent_directories() {
     let unsafe_destination = unsafe_parent.join("new-backup.sqlite");
     assert!(vault.backup_to(&unsafe_destination).is_err());
     assert!(!unsafe_destination.exists());
+}
+
+#[test]
+fn streaming_witness_publication_and_retrieval_enforce_receipts_and_detect_rollback() {
+    let (_directory, _path, mut vault) = create_vault();
+    let object = ObjectId::random();
+    let mut provider = vlt1_core::InMemoryTestProvider::from_seed([21; 32]);
+    let payload = b"streamed witness-backed payload across multiple bounded chunks";
+    let mut reader = std::io::Cursor::new(payload.as_slice());
+
+    vault
+        .put_from_reader_with_chunk_size_and_witness(object, &mut reader, 16, &mut provider)
+        .expect("streamed witness publication");
+    assert_eq!(
+        vault
+            .verify_active_objects_with_witness(&mut provider)
+            .expect("verify streamed witness version"),
+        1
+    );
+    let mut output = Vec::new();
+    vault
+        .get_to_writer_with_witness(object, &mut output, &mut provider)
+        .expect("streamed witness read");
+    assert_eq!(output, payload);
+
+    let mut stale_provider = vlt1_core::InMemoryTestProvider::from_seed([21; 32]);
+    assert!(vault.get_with_witness(object, &mut stale_provider).is_err());
+    assert_eq!(vault.status(), VaultStatus::Locked);
 }
